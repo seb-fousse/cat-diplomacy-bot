@@ -7,7 +7,7 @@ load_dotenv()
 
 bot = discord.Bot(debug_guilds=[int(os.getenv("DEV_GUILD_ID"))])
 
-bot.load_extension("cogs.setup")
+bot.load_extension("cogs.gm")
 bot.load_extension("cogs.orders")
 bot.load_extension("cogs.confessional")
 

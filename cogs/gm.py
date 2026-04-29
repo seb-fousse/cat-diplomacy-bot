@@ -3,16 +3,16 @@ from discord.ext import commands
 from models import GameState, Player
 
 
-class SetupCog(commands.Cog):
+class GMCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
-
+        
     gm = discord.SlashCommandGroup(
         "gm",
         "Game Master commands",
         default_member_permissions=discord.Permissions(administrator=True),
     )
-
+    
     # -------------------------------------------------------------------------
     # /gm setup
     # -------------------------------------------------------------------------
@@ -55,6 +55,30 @@ class SetupCog(commands.Cog):
             await ctx.followup.send(f"❌ Setup failed: `{e}`", ephemeral=True)
 
     # -------------------------------------------------------------------------
+    # /gm set_turn
+    # -------------------------------------------------------------------------
+
+    @gm.command(name="set_turn", description="[GM] Set the current season and year")
+    @commands.has_role("GM")
+    async def set_turn(
+        self,
+        ctx: discord.ApplicationContext,
+        season: discord.Option(str, "Current season", choices=["Spring", "Fall", "Winter"]),
+        year: discord.Option(int, "Current in-game year"),
+    ):
+        await ctx.defer(ephemeral=True)
+        state = await GameState.get_or_none(guild_id=ctx.guild.id)
+        if state:
+            state.season = season
+            state.year = year
+            await state.save()
+        else:
+            await GameState.create(guild_id=ctx.guild.id, season=season, year=year)
+
+        await ctx.followup.send(f"✅ Turn set to **{season} {year}**.", ephemeral=True)
+        
+    
+    # -------------------------------------------------------------------------
     # /gm add_player
     # -------------------------------------------------------------------------
 
@@ -64,7 +88,7 @@ class SetupCog(commands.Cog):
         self,
         ctx: discord.ApplicationContext,
         user: discord.Option(discord.Member, "The Discord user to add as a player"),
-        player_name: discord.Option(str, "The player's real name (e.g. Seb)"),
+        player_name: discord.Option(str, "The player's real name (e.g. John Smith)"),
         faction: discord.Option(str, "Their faction name (e.g. Whisker Kingdom)"),
     ):
         await ctx.defer(ephemeral=True)
@@ -115,7 +139,7 @@ class SetupCog(commands.Cog):
             f"✅ {user.mention} added as **{faction}**. Private channels created.",
             ephemeral=True,
         )
-
+        
     # -------------------------------------------------------------------------
     # /gm eliminate_player
     # -------------------------------------------------------------------------
@@ -152,27 +176,30 @@ class SetupCog(commands.Cog):
         )
 
     # -------------------------------------------------------------------------
-    # /gm set_turn
+    # /gm speak
     # -------------------------------------------------------------------------
 
-    @gm.command(name="set_turn", description="[GM] Set the current season and year")
+    @gm.command(name="speak", description="[GM] Send a message as the cat diplomat")
     @commands.has_role("GM")
-    async def set_turn(
+    async def speak(
         self,
         ctx: discord.ApplicationContext,
-        season: discord.Option(str, "Current season", choices=["Spring", "Fall", "Winter"]),
-        year: discord.Option(int, "Current in-game year"),
+        message: discord.Option(str, "The message to send"),
+        channel: discord.Option(discord.TextChannel, "Channel to post in (default: #town-square)", required=False),
     ):
         await ctx.defer(ephemeral=True)
-        state = await GameState.get_or_none(guild_id=ctx.guild.id)
-        if state:
-            state.season = season
-            state.year = year
-            await state.save()
-        else:
-            await GameState.create(guild_id=ctx.guild.id, season=season, year=year)
 
-        await ctx.followup.send(f"✅ Turn set to **{season} {year}**.", ephemeral=True)
+        if channel is None:
+            channel = discord.utils.get(ctx.guild.text_channels, name="town-square")
+            if channel is None:
+                await ctx.followup.send(
+                    "❌ Could not find `#town-square`. Specify a channel explicitly.",
+                    ephemeral=True,
+                )
+                return
+
+        await channel.send(message)
+        await ctx.followup.send(f"✅ Message sent to {channel.mention}.", ephemeral=True)
 
     # -------------------------------------------------------------------------
     # /gm teardown  (testing only)
@@ -328,4 +355,4 @@ class SetupCog(commands.Cog):
 
 
 def setup(bot: discord.Bot):
-    bot.add_cog(SetupCog(bot))
+    bot.add_cog(GMCog(bot))
