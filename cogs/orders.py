@@ -208,6 +208,14 @@ class OrdersCog(commands.Cog):
 
     @discord.slash_command(name="orders", description="Open the orders builder for this turn")
     async def orders(self, ctx: discord.ApplicationContext):
+        if discord.utils.get(ctx.author.roles, name="GM"):
+            await ctx.respond("⚠️ Only active players can submit orders.", ephemeral=True)
+            return
+
+        if not discord.utils.get(ctx.author.roles, name="Player"):
+            await ctx.respond("⚠️ Only active players can submit orders.", ephemeral=True)
+            return
+
         channel = ctx.channel
         category = channel.category
 
