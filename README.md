@@ -28,7 +28,16 @@ A Discord bot for running a cat-themed version of the board game [Diplomacy](htt
    python bot.py
    ```
 
-4. In Discord, run `/gm manage` and press **Setup Server** to initialise the server.
+4. In Discord, run `/gm manage` and press **Setup Server** to initialise the server. This creates a `GM` role and assigns it to you.
+
+## Adding another GM
+
+GM access is controlled entirely by Discord's built-in `GM` role, so anyone with it can run GM commands — but Discord hides slash commands from a role by default until you explicitly allow them, so two steps are needed:
+
+1. **Assign the role.** In Discord, go to **Server Settings → Members**, find the user, and add the **GM** role (created during Setup Server above).
+2. **Enable the commands for that role.** Go to **Server Settings → Integrations → [this bot] → Commands**, select `/gm`, and add the **GM** role to its allowed roles. Without this step the `/gm` commands won't appear for the user even though they hold the role, since the command group defaults to server Administrators only.
+
+Server Administrators can always see and use `/gm` commands regardless of the steps above.
 
 ## GM Commands
 

@@ -1,8 +1,11 @@
+import os
 import discord
 from discord.ext import commands
 from tortoise import Tortoise
 from models import GameState, GoldTransaction, Player, Order
 from cogs import economy
+
+SERVER_TIPS_PATH = os.path.join(os.path.dirname(__file__), "..", "content", "server_tips.md")
 
 
 class GMCog(commands.Cog):
@@ -449,7 +452,8 @@ class GMCog(commands.Cog):
         # --- 📚 Reference ---
         ref = await guild.create_category("📚 Reference", overwrites=read_only)
         await guild.create_text_channel("starting-map", category=ref)
-        await guild.create_text_channel("server-tips", category=ref)
+        tips_ch = await guild.create_text_channel("server-tips", category=ref)
+        await self._post_server_tips(tips_ch)
         await guild.create_text_channel("rules", category=ref)
         map_ch = await guild.create_text_channel("current-map", category=ref)
         await map_ch.edit(topic="Current season & year — updated by the bot each turn")
@@ -475,6 +479,15 @@ class GMCog(commands.Cog):
             everyone: discord.PermissionOverwrite(read_messages=True, send_messages=False),
             bot_member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
         })
+
+    async def _post_server_tips(self, channel: discord.TextChannel):
+        try:
+            with open(SERVER_TIPS_PATH, encoding="utf-8") as f:
+                content = f.read().strip()
+        except OSError as e:
+            print(f"[setup] Could not read server tips file: {e}")
+            return
+        await channel.send(content)
 
     async def _create_gm_channels(self, guild: discord.Guild, roles: dict):
         gm_role = roles["GM"]
