@@ -743,6 +743,10 @@ class MarketCog(commands.Cog):
 
     @discord.slash_command(name="markets", description="See the live markets, your stakes, and place bets")
     async def markets(self, ctx: discord.ApplicationContext):
+        if discord.utils.get(ctx.author.roles, name="GM"):
+            await ctx.respond("⚠️ Only players can take part in markets.", ephemeral=True)
+            return
+
         player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
         if not player:
             await ctx.respond("⚠️ Only players can take part in markets.", ephemeral=True)

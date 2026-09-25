@@ -764,6 +764,10 @@ class EconomyCog(commands.Cog):
 
     @discord.slash_command(name="gold", description="Open your faction's treasury")
     async def gold(self, ctx: discord.ApplicationContext):
+        if discord.utils.get(ctx.author.roles, name="GM"):
+            await ctx.respond("⚠️ Only players have a treasury.", ephemeral=True)
+            return
+
         player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
         if not player:
             await ctx.respond("⚠️ Only players have a treasury.", ephemeral=True)
