@@ -3,6 +3,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from discord.ext import commands
 from models import GameState, Player, Order
+from cogs import economy
 
 
 # When close hour is 0, the reminder fires at 23:xx the previous day
@@ -85,6 +86,11 @@ class TurnManagerCog(commands.Cog):
         guild = self.bot.get_guild(guild_id)
         if not guild:
             return
+
+        try:
+            await economy.snapshot_balances(guild_id, state.season, state.year)
+        except Exception as e:
+            print(f"[turn_manager] Failed to snapshot balances: {e}")
 
         all_active_players = await Player.filter(guild_id=guild_id, is_eliminated=False)
         orders = await Order.filter(

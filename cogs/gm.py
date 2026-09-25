@@ -1,7 +1,8 @@
 import discord
 from discord.ext import commands
 from tortoise import Tortoise
-from models import GameState, Player, Order
+from models import GameState, GoldTransaction, Player, Order
+from cogs import economy
 
 
 class GMCog(commands.Cog):
@@ -15,23 +16,42 @@ class GMCog(commands.Cog):
     )
     
     # -------------------------------------------------------------------------
-    # /gm setup
+    # /gm manage
     # -------------------------------------------------------------------------
 
-    @gm.command(name="setup", description="[GM] Initialize channels and roles — run once before inviting players")
+    @gm.command(name="manage", description="[GM] Open the management office — setup, players, teardown")
     @commands.has_permissions(administrator=True)
-    async def setup(self, ctx: discord.ApplicationContext):
-        await ctx.defer(ephemeral=True)
-        guild = ctx.guild
+    async def manage(self, ctx: discord.ApplicationContext):
+        content, view = await self.manage_panel(ctx.guild)
+        await ctx.respond(content=content, view=view, ephemeral=True)
 
+    async def manage_panel(
+        self, guild: discord.Guild, notice: str = "", is_setup: bool | None = None
+    ) -> tuple[str, "ManageView"]:
+        # Role cache updates arrive via gateway events, so callers that just
+        # created/deleted roles pass is_setup explicitly instead of racing them.
+        if is_setup is None:
+            is_setup = discord.utils.get(guild.roles, name="GM") is not None
+
+        header = f"{notice}\n\n" if notice else ""
+        if not is_setup:
+            body = "*Server not set up yet.* Press **Setup Server** to create roles and channels."
+        else:
+            players = await Player.filter(guild_id=guild.id).order_by("faction_name")
+            roster = "\n".join(
+                f"{'💀' if p.is_eliminated else '🐱'} **{p.faction_name}** — {p.player_name or 'unknown'} (<@{p.user_id}>)"
+                for p in players
+            ) or "*No players yet.*"
+            body = f"**Players:**\n{roster}"
+        return f"{header}🎩 **Management Office**\n\n{body}", ManageView(self, is_setup)
+
+    async def setup_server(self, guild: discord.Guild, author: discord.Member) -> str:
         existing = discord.utils.get(guild.roles, name="GM")
         if existing:
-            await ctx.followup.send(
+            return (
                 f"⚠️ Server already set up (found role **{existing.name}** id={existing.id}). "
-                "Run `/gm teardown confirm:yes` first.",
-                ephemeral=True,
+                "Run **Teardown** first."
             )
-            return
 
         try:
             print("[setup] Ensuring database schema...")
@@ -39,7 +59,7 @@ class GMCog(commands.Cog):
 
             print("[setup] Creating roles...")
             roles = await self._create_roles(guild)
-            await ctx.author.add_roles(roles["GM"])
+            await author.add_roles(roles["GM"])
 
             print("[setup] Creating public channels...")
             await self._create_public_channels(guild, roles)
@@ -48,15 +68,14 @@ class GMCog(commands.Cog):
             await self._create_gm_channels(guild, roles)
 
             print("[setup] Done.")
-            await ctx.followup.send(
+            return (
                 "✅ Server initialized! Roles and channels created. "
                 "You've been assigned the **GM** role.\n"
-                "Use `/gm add_player` to onboard each player.",
-                ephemeral=True,
+                "Use **Add Player** to onboard each player."
             )
         except Exception as e:
             print(f"[setup] ERROR: {e}")
-            await ctx.followup.send(f"❌ Setup failed: `{e}`", ephemeral=True)
+            return f"❌ Setup failed: `{e}`"
 
     # -------------------------------------------------------------------------
     # /gm set_turn
@@ -73,6 +92,8 @@ class GMCog(commands.Cog):
         await ctx.defer(ephemeral=True)
         state = await GameState.get_or_none(guild_id=ctx.guild.id)
         if state:
+            # Lock in closing balances for the turn we're leaving
+            await economy.snapshot_balances(ctx.guild.id, state.season, state.year)
             state.season = season
             state.year = year
             await state.save()
@@ -93,25 +114,18 @@ class GMCog(commands.Cog):
         
     
     # -------------------------------------------------------------------------
-    # /gm add_player
+    # Management actions — driven by the /gm manage panel
     # -------------------------------------------------------------------------
 
-    @gm.command(name="add_player", description="[GM] Onboard a player and create their private channels")
-    @commands.has_role("GM")
     async def add_player(
-        self,
-        ctx: discord.ApplicationContext,
-        user: discord.Option(discord.Member, "The Discord user to add as a player"),
-        player_name: discord.Option(str, "The player's real name (e.g. John Smith)"),
-        faction: discord.Option(str, "Their faction name (e.g. Whisker Kingdom)"),
-    ):
-        await ctx.defer(ephemeral=True)
-        guild = ctx.guild
+        self, guild: discord.Guild, user: discord.Member, player_name: str, faction: str
+    ) -> str:
+        if user.bot:
+            return "⚠️ Bots can't be added as players."
 
         player_role = discord.utils.get(guild.roles, name="Player")
         if player_role and player_role in user.roles:
-            await ctx.followup.send(f"⚠️ {user.mention} is already a player.", ephemeral=True)
-            return
+            return f"⚠️ {user.mention} is already a player."
 
         faction_role = await guild.create_role(
             name=faction, color=discord.Color.random(), mentionable=True
@@ -149,45 +163,33 @@ class GMCog(commands.Cog):
         except discord.Forbidden:
             pass  # Player has DMs disabled — not a blocker
 
-        await ctx.followup.send(
-            f"✅ {user.mention} added as **{faction}**. Private channels created.",
-            ephemeral=True,
-        )
-        
-    # -------------------------------------------------------------------------
-    # /gm eliminate_player
-    # -------------------------------------------------------------------------
+        return f"✅ {user.mention} added as **{faction}**. Private channels created."
 
-    @gm.command(name="eliminate_player", description="[GM] Eliminate a player from the game (does not delete channels)")
-    @commands.has_role("GM")
-    async def eliminate_player(
-        self,
-        ctx: discord.ApplicationContext,
-        user: discord.Option(discord.Member, "The player to eliminate"),
-    ):
-        await ctx.defer(ephemeral=True)
-        guild = ctx.guild
+    async def eliminate_player(self, guild: discord.Guild, player: Player) -> str:
+        user = guild.get_member(player.user_id)
+        if user is None:
+            try:
+                user = await guild.fetch_member(player.user_id)
+            except discord.NotFound:
+                user = None
 
-        player_role = discord.utils.get(guild.roles, name="Player")
-        eliminated_role = discord.utils.get(guild.roles, name="Eliminated")
+        if user is not None:
+            player_role = discord.utils.get(guild.roles, name="Player")
+            eliminated_role = discord.utils.get(guild.roles, name="Eliminated")
 
-        faction_roles = [r for r in user.roles if r not in (player_role, eliminated_role, guild.default_role)]
+            faction_roles = [r for r in user.roles if r not in (player_role, eliminated_role, guild.default_role)]
 
-        roles_to_remove = [r for r in [player_role, *faction_roles] if r in user.roles]
-        await user.remove_roles(*roles_to_remove)
-        await user.add_roles(eliminated_role)
-
-        player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=user.id)
-        if player:
-            player.is_eliminated = True
-            await player.save()
+            roles_to_remove = [r for r in [player_role, *faction_roles] if r in user.roles]
+            await user.remove_roles(*roles_to_remove)
+            await user.add_roles(eliminated_role)
         else:
-            print(f"[eliminate_player] No DB record for user {user.id} — skipping DB update")
+            print(f"[eliminate_player] User {player.user_id} has left the server — skipping role update")
 
-        await ctx.followup.send(
-            f"✅ {user.mention} marked as **Eliminated**. Their channels are now read-only.",
-            ephemeral=True,
-        )
+        player.is_eliminated = True
+        await player.save()
+
+        who = user.mention if user else f"**{player.faction_name}**"
+        return f"✅ {who} marked as **Eliminated**. Their channels are now read-only."
 
     # -------------------------------------------------------------------------
     # /gm speak
@@ -332,25 +334,26 @@ class GMCog(commands.Cog):
         )
 
     # -------------------------------------------------------------------------
-    # /gm teardown  (testing only)
+    # /gm gold
+    # -------------------------------------------------------------------------
+
+    @gm.command(name="gold", description="[GM] Open the treasury office — leaderboard, ledgers, adjustments")
+    @commands.has_role("GM")
+    async def gold(self, ctx: discord.ApplicationContext):
+        await ctx.respond(
+            content=await economy.gm_leaderboard_message(ctx.guild.id),
+            view=await economy.GMGoldView.create(ctx.guild.id),
+            ephemeral=True,
+        )
+
+    # -------------------------------------------------------------------------
+    # Teardown (testing only) — driven by the /gm manage panel
     # -------------------------------------------------------------------------
 
     MANAGED_ROLE_NAMES = {"GM", "Player", "Eliminated", "Spectator"}
     MANAGED_CATEGORY_PREFIXES = ("📚 ", "⚔️ ", "📰 ", "🎩 ", "🐱 ")
 
-    @gm.command(name="teardown", description="[GM] Delete all bot-created channels and roles — testing only")
-    @commands.has_permissions(administrator=True)
-    async def teardown(
-        self,
-        ctx: discord.ApplicationContext,
-        confirm: discord.Option(str, 'Type "teardown" to confirm — this deletes all channels and roles'),
-    ):
-        if confirm.lower() != "teardown":
-            await ctx.respond("Teardown cancelled. Type `teardown` to confirm.", ephemeral=True)
-            return
-
-        await ctx.defer(ephemeral=True)
-        guild = ctx.guild
+    async def teardown(self, guild: discord.Guild) -> str:
         failed = []
 
         try:
@@ -402,22 +405,18 @@ class GMCog(commands.Cog):
             # Wipe DB records for this guild — Player deletion cascades to Order and ConfessionalLog
             print("[teardown] Wiping database records...")
             await GameState.filter(guild_id=guild.id).delete()
+            await GoldTransaction.filter(guild_id=guild.id).delete()
             await Player.filter(guild_id=guild.id).delete()
 
             print("[teardown] Done.")
         except Exception as e:
             print(f"[teardown] ERROR: {e}")
-            await ctx.followup.send(f"❌ Teardown failed unexpectedly: `{e}`", ephemeral=True)
-            return
+            return f"❌ Teardown failed unexpectedly: `{e}`"
 
         if failed:
             lines = "\n".join(f"— {f}" for f in failed)
-            await ctx.followup.send(
-                f"⚠️ Teardown partially complete. Could not delete:\n{lines}",
-                ephemeral=True,
-            )
-        else:
-            await ctx.followup.send("✅ Teardown complete. Server reset to blank state.", ephemeral=True)
+            return f"⚠️ Teardown partially complete. Could not delete:\n{lines}"
+        return "✅ Teardown complete. Server reset to blank state."
 
     # -------------------------------------------------------------------------
     # Internals
@@ -487,6 +486,156 @@ class GMCog(commands.Cog):
         gm_cat = await guild.create_category("🎩 GM HQ", overwrites=overwrites)
         await guild.create_text_channel("gm-chat", category=gm_cat)
         await guild.create_text_channel("gm-commands", category=gm_cat)
+
+
+# ---------------------------------------------------------------------------
+# GM UI — /gm manage opens the management office
+# ---------------------------------------------------------------------------
+
+def _is_gm(member: discord.Member) -> bool:
+    return discord.utils.get(member.roles, name="GM") is not None
+
+
+async def _show_panel(interaction: discord.Interaction, cog: GMCog, notice: str, is_setup: bool | None = None):
+    content, view = await cog.manage_panel(interaction.guild, notice, is_setup)
+    try:
+        await interaction.edit_original_response(content=content, view=view)
+    except discord.HTTPException as e:
+        # e.g. teardown deleted the channel the panel lived in
+        print(f"[manage] Could not update panel: {e}")
+
+
+class AddPlayerModal(discord.ui.DesignerModal):
+    def __init__(self, cog: GMCog):
+        super().__init__(title="Add Player")
+        self.cog = cog
+
+        self.user_label = discord.ui.Label(
+            label="Discord user",
+            item=discord.ui.Select(
+                select_type=discord.ComponentType.user_select,
+                placeholder="Choose a member...",
+            ),
+        )
+
+        self.name_label = discord.ui.Label(label="Player's real name")
+        self.name_label.set_input_text(placeholder="e.g.  John Smith", max_length=100)
+
+        self.faction_label = discord.ui.Label(label="Faction name")
+        self.faction_label.set_input_text(placeholder="e.g.  Whisker Kingdom", max_length=90)
+
+        self.add_item(self.user_label)
+        self.add_item(self.name_label)
+        self.add_item(self.faction_label)
+
+    async def callback(self, interaction: discord.Interaction):
+        user = self.user_label.item.values[0]
+        player_name = self.name_label.item.value.strip()
+        faction = self.faction_label.item.value.strip()
+
+        await interaction.response.defer()
+        notice = await self.cog.add_player(interaction.guild, user, player_name, faction)
+        await _show_panel(interaction, self.cog, notice)
+
+
+class EliminatePlayerModal(discord.ui.DesignerModal):
+    def __init__(self, cog: GMCog, players: list[Player]):
+        super().__init__(title="Eliminate Player")
+        self.cog = cog
+
+        self.player_label = discord.ui.Label(
+            label="Player",
+            description="Their channels are kept but become read-only.",
+            item=discord.ui.Select(
+                select_type=discord.ComponentType.string_select,
+                placeholder="Choose a faction...",
+                options=[
+                    discord.SelectOption(
+                        label=p.faction_name, value=str(p.id), description=p.player_name or "unknown", emoji="🐱"
+                    )
+                    for p in players
+                ],
+            ),
+        )
+        self.add_item(self.player_label)
+
+    async def callback(self, interaction: discord.Interaction):
+        player = await Player.get_or_none(id=int(self.player_label.item.values[0]), guild_id=interaction.guild.id)
+        if not player or player.is_eliminated:
+            await interaction.response.send_message("⚠️ That player is no longer active.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        notice = await self.cog.eliminate_player(interaction.guild, player)
+        await _show_panel(interaction, self.cog, notice)
+
+
+class TeardownModal(discord.ui.DesignerModal):
+    def __init__(self, cog: GMCog):
+        super().__init__(title="Teardown Server")
+        self.cog = cog
+
+        self.confirm_label = discord.ui.Label(
+            label='Type "teardown" to confirm',
+            description="Deletes all bot-created channels and roles and wipes this server's game data.",
+        )
+        self.confirm_label.set_input_text(placeholder="teardown", max_length=20)
+        self.add_item(self.confirm_label)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.confirm_label.item.value.strip().lower() != "teardown":
+            await interaction.response.send_message("Teardown cancelled. Type `teardown` to confirm.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        notice = await self.cog.teardown(interaction.guild)
+        # Only a clean teardown is known to have removed the GM role
+        await _show_panel(interaction, self.cog, notice, is_setup=False if notice.startswith("✅") else None)
+
+
+class ManageView(discord.ui.View):
+    def __init__(self, cog: GMCog, is_setup: bool):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+        # Only offer the actions that make sense for the server's current state
+        if is_setup:
+            self.remove_item(self.setup_server)
+        else:
+            for item in (self.add_player, self.eliminate_player, self.teardown):
+                self.remove_item(item)
+
+    @discord.ui.button(label="Setup Server", style=discord.ButtonStyle.success, emoji="🏗️")
+    async def setup_server(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.defer()
+        notice = await self.cog.setup_server(interaction.guild, interaction.user)
+        # A failed setup may have left some roles behind — fall back to the role cache
+        await _show_panel(interaction, self.cog, notice, is_setup=None if notice.startswith("❌") else True)
+
+    @discord.ui.button(label="Add Player", style=discord.ButtonStyle.success, emoji="➕")
+    async def add_player(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not _is_gm(interaction.user):
+            await interaction.response.send_message("⚠️ Only the GM can add players.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddPlayerModal(self.cog))
+
+    @discord.ui.button(label="Eliminate Player", style=discord.ButtonStyle.secondary, emoji="💀")
+    async def eliminate_player(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not _is_gm(interaction.user):
+            await interaction.response.send_message("⚠️ Only the GM can eliminate players.", ephemeral=True)
+            return
+        # Select menus cap at 25 options
+        players = await Player.filter(
+            guild_id=interaction.guild.id, is_eliminated=False
+        ).order_by("faction_name").limit(25)
+        if not players:
+            await interaction.response.send_message("⚠️ There are no active players.", ephemeral=True)
+            return
+        await interaction.response.send_modal(EliminatePlayerModal(self.cog, players))
+
+    @discord.ui.button(label="Teardown", style=discord.ButtonStyle.danger, emoji="🧨")
+    async def teardown(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.send_modal(TeardownModal(self.cog))
 
 
 def setup(bot: discord.Bot):

@@ -9,6 +9,7 @@ class Player(Model):
     player_name  = fields.CharField(max_length=100, null=True)
     faction_name = fields.CharField(max_length=100)
     is_eliminated = fields.BooleanField(default=False)
+    gold_balance = fields.IntField(default=0)  # cache of the GoldTransaction ledger; only mutate via cogs.economy
     created_at   = fields.DatetimeField(auto_now_add=True)
 
     orders: fields.ReverseRelation["Order"]
@@ -58,3 +59,36 @@ class ConfessionalLog(Model):
 
     class Meta:
         table = "confessional_log"
+
+
+class GoldTransaction(Model):
+    id               = fields.IntField(pk=True)
+    guild_id         = fields.BigIntField()
+    # Null from_player = gold created (GM grant); null to_player = gold destroyed (GM deduction)
+    from_player      = fields.ForeignKeyField("models.Player", related_name="gold_sent", null=True)
+    to_player        = fields.ForeignKeyField("models.Player", related_name="gold_received", null=True)
+    amount           = fields.IntField()                    # always positive
+    transaction_type = fields.CharField(max_length=20)      # TRANSFER | GM_GRANT | GM_DEDUCT
+    reason           = fields.CharField(max_length=500, null=True)
+    season           = fields.CharField(max_length=20, null=True)
+    year             = fields.IntField(null=True)
+    initiated_by     = fields.BigIntField()                 # Discord user id
+    from_balance_after = fields.IntField(null=True)
+    to_balance_after   = fields.IntField(null=True)
+    created_at       = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "gold_transactions"
+
+
+class BalanceSnapshot(Model):
+    id         = fields.IntField(pk=True)
+    player     = fields.ForeignKeyField("models.Player", related_name="balance_snapshots")
+    season     = fields.CharField(max_length=20)
+    year       = fields.IntField()
+    balance    = fields.IntField()
+    created_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "balance_snapshots"
+        unique_together = (("player", "season", "year"),)
