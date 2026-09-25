@@ -276,11 +276,13 @@ class GMCog(commands.Cog):
                 except discord.Forbidden:
                     failed.append(f"category {category.name} (no permission)")
 
-            # Delete roles by name — re-fetch to get current state
+            # Delete roles by name — re-fetch to get current state. Faction roles are looked up
+            # from the DB now, before the wipe below removes the Player rows that name them.
+            faction_names = {p.faction_name for p in await Player.filter(guild_id=guild.id)}
             print("[teardown] Fetching roles...")
             all_roles = await guild.fetch_roles()
             for role in all_roles:
-                if role.name in self.MANAGED_ROLE_NAMES and not role.is_default():
+                if not role.is_default() and (role.name in self.MANAGED_ROLE_NAMES or role.name in faction_names):
                     try:
                         print(f"[teardown] Deleting role @{role.name}")
                         await role.delete()
