@@ -298,9 +298,11 @@ async def markets_panel_message(player: Player, selected_id: int | None = None, 
         my_positions[pos.event_id].append(pos)
     locked = sum(p.amount for positions in my_positions.values() for p in positions)
 
+    eliminated_notice = "\n⚠️ **You are eliminated and cannot place new bets.**" if player.is_eliminated else ""
     lines = [
         f"{header}🎲 **Markets** — you hold **{player.gold_balance} gold**"
         + (f" · **{locked} gold** locked in markets" if locked else "")
+        + eliminated_notice
     ]
     if not events:
         lines.append("\n*No markets are open right now.*")

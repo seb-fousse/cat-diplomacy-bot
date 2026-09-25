@@ -120,16 +120,19 @@ class ConfessionalCog(commands.Cog):
 
     @discord.slash_command(name="confessional", description="Post anonymously to the confessional channel")
     async def confessional(self, ctx: discord.ApplicationContext):
+        player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
         channel = ctx.channel
         category = channel.category
 
-        if not (
+        is_in_player_channel = (
             category
             and category.name.startswith("🐱 ")
             and channel.name.endswith("-orders")
-        ):
+        )
+
+        if not is_in_player_channel and not player.is_eliminated:
             await ctx.respond(
-                "⚠️ This command can only be used in your private orders channel.",
+                "⚠️ This command can only be used in your private orders channel, or by eliminated players.",
                 ephemeral=True,
             )
             return
