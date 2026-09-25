@@ -4,7 +4,7 @@ from collections import defaultdict
 import discord
 from discord.ext import commands
 
-from models import GoldTransaction, MarketEvent, MarketPosition, Player
+from models import GameState, GoldTransaction, MarketEvent, MarketPosition, Player
 from cogs import economy
 from cogs.economy import MARKET_SIDES, EconomyError, code_table
 
@@ -390,6 +390,11 @@ async def _recent_events(guild_id: int) -> list[MarketEvent]:
     return await MarketEvent.filter(guild_id=guild_id).order_by("-id").limit(25)
 
 
+async def _markets_enabled(guild_id: int) -> bool:
+    state = await GameState.get_or_none(guild_id=guild_id)
+    return bool(state and state.markets_enabled)
+
+
 def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
@@ -397,8 +402,9 @@ def _truncate(text: str, limit: int) -> str:
 async def gm_list_message(guild_id: int, notice: str = "") -> str:
     header = f"{notice}\n\n" if notice else ""
     events = await _recent_events(guild_id)
+    status = "✅ Markets are **open** to players." if await _markets_enabled(guild_id) else "🚫 Markets are **closed** to players."
     if not events:
-        body = "*No markets yet.* Press **New Market** to post one in #town-square."
+        body = f"{status}\n\n*No markets yet.* Press **New Market** to post one in #town-square."
     else:
         rows = []
         for e in events:
@@ -408,7 +414,7 @@ async def gm_list_message(guild_id: int, notice: str = "") -> str:
             rows.append([STATUS_EMOJI[e.status], e.status, f"#{e.id}", _truncate(e.question, 28), str(total), *odds])
         # Every row, header included, starts with exactly one emoji, so emoji width shifts all rows equally
         table = code_table(["🎲", "Status", "#", "Market", "Gold", "YES", "NO"], rows, left={0, 1, 3})
-        body = table + "\n*Pick a market below to see its breakdown and manage it.*"
+        body = f"{status}\n\n" + table + "\n*Pick a market below to see its breakdown and manage it.*"
     return _truncate(f"{header}🎲 **Market Office**\n\n{body}", 2000)
 
 
@@ -635,7 +641,7 @@ class CancelMarketModal(discord.ui.DesignerModal):
 class GMMarketView(discord.ui.View):
     """Two modes: the market list (pick one or post a new one), or one market with its actions."""
 
-    def __init__(self, guild_id: int, events: list[MarketEvent], selected: MarketEvent | None):
+    def __init__(self, guild_id: int, events: list[MarketEvent], selected: MarketEvent | None, markets_enabled: bool = False):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self.selected_id = selected.id if selected else None
@@ -653,6 +659,10 @@ class GMMarketView(discord.ui.View):
             return
 
         self._button("New Market", discord.ButtonStyle.success, "➕", self.new_market)
+        if markets_enabled:
+            self._button("Disable Markets", discord.ButtonStyle.danger, "🚫", self.toggle_markets)
+        else:
+            self._button("Enable Markets", discord.ButtonStyle.success, "✅", self.toggle_markets)
         self._button("Refresh", discord.ButtonStyle.secondary, "🔄", self.refresh_panel)
         if events:
             picker = discord.ui.Select(
@@ -678,7 +688,8 @@ class GMMarketView(discord.ui.View):
     async def create(cls, guild_id: int, selected_id: int | None = None) -> "GMMarketView":
         events = await _recent_events(guild_id)
         selected = await MarketEvent.get_or_none(id=selected_id, guild_id=guild_id) if selected_id else None
-        return cls(guild_id, events, selected)
+        markets_enabled = await _markets_enabled(guild_id)
+        return cls(guild_id, events, selected, markets_enabled)
 
     async def _selected(self, interaction: discord.Interaction) -> MarketEvent | None:
         event = await MarketEvent.get_or_none(id=self.selected_id, guild_id=self.guild_id) if self.selected_id else None
@@ -700,6 +711,19 @@ class GMMarketView(discord.ui.View):
 
     async def new_market(self, interaction: discord.Interaction):
         await interaction.response.send_modal(NewMarketModal(self.guild_id))
+
+    async def toggle_markets(self, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if not state:
+            await interaction.response.send_message(
+                "⚠️ Set the turn first (`/gm turn`) before enabling markets.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        state.markets_enabled = not state.markets_enabled
+        await state.save(update_fields=["markets_enabled"])
+        notice = "✅ Markets are now **open** to players." if state.markets_enabled else "🚫 Markets are now **closed** to players."
+        await _show_panel(interaction, self.guild_id, None, notice)
 
     async def close_betting(self, interaction: discord.Interaction):
         event = await self._selected(interaction)
@@ -741,10 +765,14 @@ class MarketCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
 
-    @discord.slash_command(name="markets", description="See the live markets, your stakes, and place bets")
+    @discord.slash_command(name="markets", description="???")
     async def markets(self, ctx: discord.ApplicationContext):
         if discord.utils.get(ctx.author.roles, name="GM"):
             await ctx.respond("⚠️ Only players can take part in markets.", ephemeral=True)
+            return
+
+        if not await _markets_enabled(ctx.guild.id):
+            await ctx.respond("Meow", ephemeral=True)
             return
 
         player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)

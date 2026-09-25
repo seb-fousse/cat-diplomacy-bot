@@ -50,3 +50,10 @@ async def _migrate():
         await conn.execute_script(
             'ALTER TABLE "balance_snapshots" ADD COLUMN "locked" INT NOT NULL DEFAULT 0'
         )
+
+    _, rows = await conn.execute_query("PRAGMA table_info(game_state)")
+    if not any(row["name"] == "markets_enabled" for row in rows):
+        print("[db] Adding game_state.markets_enabled column")
+        await conn.execute_script(
+            'ALTER TABLE "game_state" ADD COLUMN "markets_enabled" INT NOT NULL DEFAULT 0'
+        )

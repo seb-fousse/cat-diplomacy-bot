@@ -44,6 +44,7 @@ class GameState(Model):
     close_weekdays = fields.CharField(max_length=100, null=True)  # "MON,WED,FRI" — comma-separated day abbreviations
     close_hour_utc = fields.IntField(null=True)    # 0–23
     close_minute_utc = fields.IntField(default=0)  # 0–59
+    markets_enabled = fields.BooleanField(default=False)  # gates the player-facing /markets command
     updated_at = fields.DatetimeField(auto_now=True)
 
     class Meta:
