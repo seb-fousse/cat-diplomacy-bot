@@ -12,6 +12,7 @@ bot.load_extension("cogs.orders")
 bot.load_extension("cogs.confessional")
 bot.load_extension("cogs.turn_manager")
 bot.load_extension("cogs.economy")
+bot.load_extension("cogs.market")
 
 
 @bot.event

@@ -2,8 +2,8 @@ import os
 import discord
 from discord.ext import commands
 from tortoise import Tortoise
-from models import GameState, GoldTransaction, Player, Order
-from cogs import economy
+from models import GameState, GoldTransaction, MarketEvent, Player, Order
+from cogs import economy, market
 
 SERVER_TIPS_PATH = os.path.join(os.path.dirname(__file__), "..", "content", "server_tips.md")
 
@@ -274,6 +274,19 @@ class GMCog(commands.Cog):
         )
 
     # -------------------------------------------------------------------------
+    # /gm markets
+    # -------------------------------------------------------------------------
+
+    @gm.command(name="markets", description="[GM] Open the market office — post, close, resolve and cancel markets")
+    @commands.has_role("GM")
+    async def markets(self, ctx: discord.ApplicationContext):
+        await ctx.respond(
+            content=await market.gm_panel_message(ctx.guild.id),
+            view=await market.GMMarketView.create(ctx.guild.id),
+            ephemeral=True,
+        )
+
+    # -------------------------------------------------------------------------
     # Teardown (testing only) — driven by the /gm manage panel
     # -------------------------------------------------------------------------
 
@@ -329,10 +342,11 @@ class GMCog(commands.Cog):
                     except discord.HTTPException as e:
                         failed.append(f"role @{role.name} ({e})")
 
-            # Wipe DB records for this guild — Player deletion cascades to Order and ConfessionalLog
+            # Wipe DB records for this guild — Player deletion cascades to Order, ConfessionalLog and MarketPosition
             print("[teardown] Wiping database records...")
             await GameState.filter(guild_id=guild.id).delete()
             await GoldTransaction.filter(guild_id=guild.id).delete()
+            await MarketEvent.filter(guild_id=guild.id).delete()
             await Player.filter(guild_id=guild.id).delete()
 
             print("[teardown] Done.")

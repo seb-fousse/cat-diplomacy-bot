@@ -73,8 +73,9 @@ class GoldTransaction(Model):
     from_player      = fields.ForeignKeyField("models.Player", related_name="gold_sent", null=True)
     to_player        = fields.ForeignKeyField("models.Player", related_name="gold_received", null=True)
     amount           = fields.IntField()                    # always positive
-    transaction_type = fields.CharField(max_length=20)      # TRANSFER | GM_GRANT | GM_DEDUCT
+    transaction_type = fields.CharField(max_length=20)      # TRANSFER | GM_GRANT | GM_DEDUCT | MARKET_STAKE | MARKET_PAYOUT | MARKET_REFUND
     reason           = fields.CharField(max_length=500, null=True)
+    market_event     = fields.ForeignKeyField("models.MarketEvent", related_name="transactions", null=True, on_delete=fields.SET_NULL)
     season           = fields.CharField(max_length=20, null=True)
     year             = fields.IntField(null=True)
     initiated_by     = fields.BigIntField()                 # Discord user id
@@ -92,8 +93,46 @@ class BalanceSnapshot(Model):
     season     = fields.CharField(max_length=20)
     year       = fields.IntField()
     balance    = fields.IntField()
+    locked     = fields.IntField(default=0)  # gold staked on unsettled markets at snapshot time
     created_at = fields.DatetimeField(auto_now=True)
 
     class Meta:
         table = "balance_snapshots"
         unique_together = (("player", "season", "year"),)
+
+
+class MarketEvent(Model):
+    id          = fields.IntField(pk=True)
+    guild_id    = fields.BigIntField()
+    question    = fields.CharField(max_length=200)
+    description = fields.TextField(null=True)
+    status      = fields.CharField(max_length=20, default="OPEN")  # OPEN -> CLOSED -> RESOLVED, or CANCELLED from OPEN/CLOSED
+    outcome     = fields.CharField(max_length=3, null=True)       # YES | NO, set on resolution
+    refunded    = fields.BooleanField(default=False)               # resolved, but nobody backed the winner so all stakes were returned
+    cancel_reason = fields.CharField(max_length=500, null=True)
+    channel_id  = fields.BigIntField(null=True)                    # the public post in #town-square
+    message_id  = fields.BigIntField(null=True)
+    created_by  = fields.BigIntField()
+    created_at  = fields.DatetimeField(auto_now_add=True)
+    closed_at   = fields.DatetimeField(null=True)
+    resolved_at = fields.DatetimeField(null=True)                  # also set on cancellation
+
+    positions: fields.ReverseRelation["MarketPosition"]
+
+    class Meta:
+        table = "market_events"
+
+
+class MarketPosition(Model):
+    id         = fields.IntField(pk=True)
+    event      = fields.ForeignKeyField("models.MarketEvent", related_name="positions")
+    player     = fields.ForeignKeyField("models.Player", related_name="market_positions")
+    side       = fields.CharField(max_length=3)  # YES | NO — a player may hold one position on each side
+    amount     = fields.IntField(default=0)      # total staked; only mutate via cogs.economy
+    payout     = fields.IntField(null=True)      # gold returned at settlement (0 for a losing position)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "market_positions"
+        unique_together = (("event", "player", "side"),)

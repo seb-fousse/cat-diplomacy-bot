@@ -4,14 +4,16 @@ from collections import defaultdict
 
 import discord
 from discord.ext import commands
+from tortoise import timezone
 from tortoise.expressions import F
 from tortoise.transactions import in_transaction
 
-from models import BalanceSnapshot, GameState, GoldTransaction, Player
+from models import BalanceSnapshot, GameState, GoldTransaction, MarketEvent, MarketPosition, Player
 import cogs.orders  # noqa: F401 — applies the pycord patch that makes optional modal inputs work
 
 SEASON_ORDER = {"Spring": 0, "Fall": 1, "Winter": 2}
 HISTORY_LIMIT = 15
+MARKET_SIDES = ("YES", "NO")
 
 
 class EconomyError(Exception):
@@ -93,12 +95,184 @@ async def adjust(player: Player, delta: int, reason: str, initiated_by: int) -> 
         )
 
 
+# ---------------------------------------------------------------------------
+# Market ledger — staked gold leaves the player's balance and sits in the
+# market's positions until the market is settled or cancelled.
+#
+# Lifecycle: OPEN --close_market--> CLOSED --settle_market--> RESOLVED
+#            OPEN/CLOSED --cancel_market--> CANCELLED
+# Every transition is a conditional UPDATE on the current status, so a stale
+# panel or a double click can never apply a step twice or out of order. Stakes
+# check the status inside the same transaction as the debit; SQLite serialises
+# transactions, so a bet can't land after betting closes.
+# ---------------------------------------------------------------------------
+
+async def stake(player: Player, event_id: int, side: str, amount: int, initiated_by: int) -> MarketPosition:
+    if amount <= 0:
+        raise EconomyError("Amount must be positive.")
+    if side not in MARKET_SIDES:
+        raise EconomyError("Unknown side.")
+
+    season, year = await _current_turn(player.guild_id)
+    async with in_transaction() as conn:
+        event = await MarketEvent.get_or_none(id=event_id, guild_id=player.guild_id, using_db=conn)
+        if not event or event.status != "OPEN":
+            raise EconomyError("Betting on this market is closed.")
+
+        debited = await Player.filter(
+            id=player.id, is_eliminated=False, gold_balance__gte=amount
+        ).using_db(conn).update(gold_balance=F("gold_balance") - amount)
+        if not debited:
+            fresh = await Player.get(id=player.id, using_db=conn)
+            if fresh.is_eliminated:
+                raise EconomyError("Eliminated players can't place bets.")
+            raise EconomyError("Insufficient gold.")
+
+        position, _ = await MarketPosition.get_or_create(
+            event=event, player_id=player.id, side=side, defaults={"amount": 0}, using_db=conn
+        )
+        await MarketPosition.filter(id=position.id).using_db(conn).update(amount=F("amount") + amount)
+        await position.refresh_from_db(using_db=conn)
+
+        balance_after = (await Player.get(id=player.id, using_db=conn)).gold_balance
+        await GoldTransaction.create(
+            guild_id=player.guild_id,
+            from_player_id=player.id,
+            to_player=None,
+            amount=amount,
+            transaction_type="MARKET_STAKE",
+            reason=f"{side} — {event.question}",
+            market_event=event,
+            season=season,
+            year=year,
+            initiated_by=initiated_by,
+            from_balance_after=balance_after,
+            using_db=conn,
+        )
+        return position
+
+
+async def close_market(event_id: int, guild_id: int):
+    closed = await MarketEvent.filter(id=event_id, guild_id=guild_id, status="OPEN").update(
+        status="CLOSED", closed_at=timezone.now()
+    )
+    if not closed:
+        raise EconomyError("Only an open market can be closed.")
+
+
+async def _pay_positions(conn, event: MarketEvent, payouts: dict[int, int], tx_type: str, reason: str, initiated_by: int):
+    """Record each position's payout and credit each player once with their combined total."""
+    season, year = await _current_turn(event.guild_id)
+    positions = await MarketPosition.filter(event_id=event.id).using_db(conn)
+    per_player = defaultdict(int)
+    for pos in positions:
+        paid = payouts.get(pos.id, 0)
+        await MarketPosition.filter(id=pos.id).using_db(conn).update(payout=paid)
+        per_player[pos.player_id] += paid
+
+    for player_id, total in per_player.items():
+        if total <= 0:
+            continue
+        # Eliminated players are paid too — their treasury is frozen, not forfeit
+        await Player.filter(id=player_id).using_db(conn).update(gold_balance=F("gold_balance") + total)
+        balance_after = (await Player.get(id=player_id, using_db=conn)).gold_balance
+        await GoldTransaction.create(
+            guild_id=event.guild_id,
+            from_player=None,
+            to_player_id=player_id,
+            amount=total,
+            transaction_type=tx_type,
+            reason=reason,
+            market_event=event,
+            season=season,
+            year=year,
+            initiated_by=initiated_by,
+            to_balance_after=balance_after,
+            using_db=conn,
+        )
+
+
+def _split_losing_pool(winners: list[MarketPosition], win_pool: int, lose_pool: int) -> dict[int, int]:
+    """Largest-remainder split: everyone gets their share rounded down, then the leftover
+    coins go one each to the winners who lost the most to rounding (ties: bigger stake,
+    then earlier bet), so the whole pool is always paid out."""
+    payouts = {p.id: p.amount + p.amount * lose_pool // win_pool for p in winners}
+    leftover = lose_pool - sum(p.amount * lose_pool // win_pool for p in winners)
+    by_fraction = sorted(winners, key=lambda p: (-(p.amount * lose_pool % win_pool), -p.amount, p.id))
+    for p in by_fraction[:leftover]:
+        payouts[p.id] += 1
+    return payouts
+
+
+async def settle_market(event_id: int, guild_id: int, outcome: str, initiated_by: int) -> MarketEvent:
+    """Parimutuel payout: each winning position gets its stake back plus a share of the
+    losing pool proportional to its stake. If nobody backed the winning side, every
+    stake is refunded instead."""
+    if outcome not in MARKET_SIDES:
+        raise EconomyError("Unknown outcome.")
+
+    async with in_transaction() as conn:
+        resolved = await MarketEvent.filter(id=event_id, guild_id=guild_id, status="CLOSED").using_db(conn).update(
+            status="RESOLVED", outcome=outcome, resolved_at=timezone.now()
+        )
+        if not resolved:
+            raise EconomyError("Close betting before resolving — only a closed market can be resolved.")
+
+        event = await MarketEvent.get(id=event_id, using_db=conn)
+        positions = await MarketPosition.filter(event_id=event_id).using_db(conn)
+        win_pool = sum(p.amount for p in positions if p.side == outcome)
+        lose_pool = sum(p.amount for p in positions if p.side != outcome)
+
+        if not positions:
+            return event
+        if win_pool == 0:
+            await MarketEvent.filter(id=event_id).using_db(conn).update(refunded=True)
+            event.refunded = True
+            payouts = {p.id: p.amount for p in positions}
+            await _pay_positions(
+                conn, event, payouts, "MARKET_REFUND",
+                f"{event.question} (resolved {outcome}, nobody backed it — stakes returned)", initiated_by,
+            )
+        else:
+            payouts = _split_losing_pool([p for p in positions if p.side == outcome], win_pool, lose_pool)
+            await _pay_positions(
+                conn, event, payouts, "MARKET_PAYOUT", f"{event.question} (resolved {outcome})", initiated_by
+            )
+        return event
+
+
+async def cancel_market(event_id: int, guild_id: int, reason: str, initiated_by: int) -> MarketEvent:
+    async with in_transaction() as conn:
+        cancelled = await MarketEvent.filter(
+            id=event_id, guild_id=guild_id, status__in=["OPEN", "CLOSED"]
+        ).using_db(conn).update(status="CANCELLED", cancel_reason=reason, resolved_at=timezone.now())
+        if not cancelled:
+            raise EconomyError("This market has already been settled or cancelled.")
+
+        event = await MarketEvent.get(id=event_id, using_db=conn)
+        positions = await MarketPosition.filter(event_id=event_id).using_db(conn)
+        await _pay_positions(
+            conn, event, {p.id: p.amount for p in positions}, "MARKET_REFUND",
+            f"{event.question} (cancelled — stakes returned)", initiated_by,
+        )
+        return event
+
+
+async def locked_gold(guild_id: int) -> dict[int, int]:
+    """Gold each player has staked on markets that haven't been settled yet, by player id."""
+    locked = defaultdict(int)
+    for pos in await MarketPosition.filter(event__guild_id=guild_id, event__status__in=["OPEN", "CLOSED"]):
+        locked[pos.player_id] += pos.amount
+    return locked
+
+
 async def snapshot_balances(guild_id: int, season: str, year: int):
     """Record every player's balance for a turn. Idempotent — re-running overwrites."""
+    locked = await locked_gold(guild_id)
     for player in await Player.filter(guild_id=guild_id):
         await BalanceSnapshot.update_or_create(
             player=player, season=season, year=year,
-            defaults={"balance": player.gold_balance},
+            defaults={"balance": player.gold_balance, "locked": locked[player.id]},
         )
 
 
@@ -117,8 +291,19 @@ def _note(tx: GoldTransaction) -> str:
     return f' — "{text}"'
 
 
+def _market_text(tx: GoldTransaction) -> str:
+    text = tx.reason or "a market"
+    return text if len(text) <= 100 else text[:97] + "..."
+
+
 def describe_for_player(tx: GoldTransaction, viewer: Player) -> str:
     turn = _turn_label(tx)
+    if tx.transaction_type == "MARKET_STAKE":
+        return f"`{turn}` −{tx.amount} bet {_market_text(tx)}"
+    if tx.transaction_type == "MARKET_PAYOUT":
+        return f"`{turn}` +{tx.amount} market winnings — {_market_text(tx)}"
+    if tx.transaction_type == "MARKET_REFUND":
+        return f"`{turn}` +{tx.amount} market refund — {_market_text(tx)}"
     if tx.transaction_type == "TRANSFER":
         if tx.from_player_id == viewer.id:
             return f"`{turn}` −{tx.amount} to **{tx.to_player.faction_name}**{_note(tx)}"
@@ -130,6 +315,12 @@ def describe_for_player(tx: GoldTransaction, viewer: Player) -> str:
 
 def describe_for_gm(tx: GoldTransaction) -> str:
     turn = _turn_label(tx)
+    if tx.transaction_type == "MARKET_STAKE":
+        return f"`{turn}` {tx.from_player.faction_name} bet **{tx.amount}** {_market_text(tx)}"
+    if tx.transaction_type == "MARKET_PAYOUT":
+        return f"`{turn}` Market winnings → {tx.to_player.faction_name}: **+{tx.amount}** — {_market_text(tx)}"
+    if tx.transaction_type == "MARKET_REFUND":
+        return f"`{turn}` Market refund → {tx.to_player.faction_name}: **+{tx.amount}** — {_market_text(tx)}"
     if tx.transaction_type == "TRANSFER":
         return f"`{turn}` {tx.from_player.faction_name} → {tx.to_player.faction_name}: **{tx.amount}**{_note(tx)}"
     if tx.transaction_type == "GM_GRANT":
@@ -153,10 +344,12 @@ async def leaderboard_text(guild_id: int) -> str:
     players = await Player.filter(guild_id=guild_id).order_by("-gold_balance", "faction_name")
     if not players:
         return "*No players yet.*"
+    locked = await locked_gold(guild_id)
     lines = []
     for i, p in enumerate(players, 1):
         tag = " *(eliminated)*" if p.is_eliminated else ""
-        lines.append(f"{i}. **{p.faction_name}** — {p.gold_balance} gold{tag}")
+        in_markets = f" (+{locked[p.id]} locked in markets)" if locked[p.id] else ""
+        lines.append(f"{i}. **{p.faction_name}** — {p.gold_balance} gold{in_markets}{tag}")
     return "\n".join(lines)
 
 
@@ -208,7 +401,17 @@ async def build_report(guild_id: int) -> tuple[str, list[discord.File]]:
     if peak:
         lines.append(f"👑 **Peak fortune:** {peak[0]} held {peak[1]} gold ({peak[2]})")
 
-    gm_actions = [t for t in txs if t.transaction_type != "TRANSFER"]
+    stakes = [t for t in txs if t.transaction_type == "MARKET_STAKE"]
+    if stakes:
+        winnings = sum(t.amount for t in txs if t.transaction_type == "MARKET_PAYOUT")
+        markets = len({t.market_event_id for t in stakes})
+        lines.append("")
+        lines.append(
+            f"🎲 **Markets:** {len(stakes)} bets across {markets} markets, "
+            f"{sum(t.amount for t in stakes)} gold wagered, {winnings} gold paid to winners"
+        )
+
+    gm_actions = [t for t in txs if t.transaction_type in ("GM_GRANT", "GM_DEDUCT")]
     if gm_actions:
         lines.append("")
         lines.append(f"**GM interventions:** {len(gm_actions)} — full list in `ledger.csv`")
@@ -246,8 +449,8 @@ def _snapshots_csv(snapshots: list[BalanceSnapshot]) -> discord.File:
     ordered = sorted(snapshots, key=lambda s: (s.year, SEASON_ORDER.get(s.season, 99), s.player.faction_name))
     return _csv_file(
         "balances_by_turn.csv",
-        ["year", "season", "faction", "player", "balance"],
-        [[s.year, s.season, s.player.faction_name, s.player.player_name or "", s.balance] for s in ordered],
+        ["year", "season", "faction", "player", "balance", "locked_in_markets"],
+        [[s.year, s.season, s.player.faction_name, s.player.player_name or "", s.balance, s.locked] for s in ordered],
     )
 
 
@@ -255,10 +458,12 @@ def _snapshots_csv(snapshots: list[BalanceSnapshot]) -> discord.File:
 # Player UI — /gold opens a treasury panel
 # ---------------------------------------------------------------------------
 
-def _balance_message(player: Player, notice: str = "") -> str:
+async def _balance_message(player: Player, notice: str = "") -> str:
     frozen = "\n*Your treasury is frozen — you have been eliminated.*" if player.is_eliminated else ""
     header = f"{notice}\n\n" if notice else ""
-    return f"{header}💰 **{player.faction_name}** holds **{player.gold_balance} gold**.{frozen}"
+    locked = (await locked_gold(player.guild_id))[player.id]
+    in_markets = f"\n🎲 **{locked} gold** is locked in markets until they're settled — see `/markets`." if locked else ""
+    return f"{header}💰 **{player.faction_name}** holds **{player.gold_balance} gold**.{in_markets}{frozen}"
 
 
 async def _history_message(player: Player) -> str:
@@ -327,7 +532,7 @@ class SendGoldModal(discord.ui.DesignerModal):
 
         await sender.refresh_from_db()
         await interaction.response.edit_message(
-            content=_balance_message(sender, f"✅ Sent **{amount} gold** to **{recipient.faction_name}**."),
+            content=await _balance_message(sender, f"✅ Sent **{amount} gold** to **{recipient.faction_name}**."),
             view=GoldView(sender),
         )
 
@@ -355,7 +560,7 @@ class GoldView(discord.ui.View):
 
     @discord.ui.button(label="Refresh Balance", style=discord.ButtonStyle.primary, emoji="💰")
     async def balance(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.edit_message(content=_balance_message(await self._player()), view=self)
+        await interaction.response.edit_message(content=await _balance_message(await self._player()), view=self)
 
     @discord.ui.button(label="Send Gold", style=discord.ButtonStyle.success, emoji="📤")
     async def send_gold(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -528,7 +733,7 @@ class EconomyCog(commands.Cog):
         if not player:
             await ctx.respond("⚠️ Only players have a treasury.", ephemeral=True)
             return
-        await ctx.respond(content=_balance_message(player), view=GoldView(player), ephemeral=True)
+        await ctx.respond(content=await _balance_message(player), view=GoldView(player), ephemeral=True)
 
 
 def setup(bot: discord.Bot):

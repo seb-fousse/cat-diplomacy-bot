@@ -87,6 +87,8 @@ class TurnManagerCog(commands.Cog):
         if not guild:
             return
 
+        # TODO(markets): remind the GM in #gm-commands of markets still open for betting when
+        # orders close, so a market isn't left open once its outcome is effectively known.
         try:
             await economy.snapshot_balances(guild_id, state.season, state.year)
         except Exception as e:

@@ -9,6 +9,7 @@ A Discord bot for running a cat-themed version of the board game [Diplomacy](htt
 - **Orders** — an interactive order-builder that lets players submit moves, which are persisted to a database per turn
 - **Confessional** — players can post anonymously to a public confessional channel via their private orders channel, with text, images, or voice notes
 - **Gold** — each faction has a private treasury; players can secretly send gold to each other, the GM can grant or confiscate it, and every transaction plus per-turn balances are recorded for an end-of-game retrospective
+- **Markets** — the GM posts YES/NO prediction markets to `#town-square`; players anonymously stake gold on either side (or both), stakes stay locked until the GM resolves, and the winning side splits the losing pool in proportion to their stakes
 
 ## Setup
 
@@ -47,7 +48,8 @@ Server Administrators can always see and use `/gm` commands regardless of the st
 | `/gm turn` | Open the turn control panel: **Set Turn** (season + year; renames the `#current-map` channel to match) and **Set Close Schedule** (recurring cron-style schedule — days + UTC time — for when orders auto-close) |
 | `/gm view_orders` | View all orders submitted so far for the current turn, grouped by faction |
 | `/gm speak` | Send a message as the Cat Diplomat, to `#town-square` or a specified channel |
-| `/gm gold` | Open the treasury office: leaderboard, a dropdown to inspect any player's ledger, **Adjust Gold** (grant or confiscate with a required reason; can't go below 0), and **Report** (end-of-game retrospective with `ledger.csv` and `balances_by_turn.csv` attached, visible only to you) |
+| `/gm markets` | Open the market office. The list view shows every market (status, question, total gold, YES/NO odds) with **New Market** (question + optional resolution criteria; posts and pins it in `#town-square` immediately). Picking a market opens its breakdown — timeline, pools, bet counts, and a per-faction table of stakes with projected payouts (or actual payouts and net once settled; GM eyes only) — with **Back to list**, **Close Betting**, **Resolve & Pay Out** (only after betting is closed), and **Cancel & Refund** (public reason required). Winners get their stake back plus a proportional share of the losing pool — leftover coins from rounding go one each to the winners with the largest fractional shares, so the whole pool is always paid out; if nobody backed the winning side, every stake is refunded. Settled markets are unpinned. Each bettor is notified of their result in their `-diplomacy` channel |
+| `/gm gold` | Open the treasury office: leaderboard, a dropdown to inspect any player's ledger, gold locked in markets shown beside each balance, **Adjust Gold** (grant or confiscate with a required reason; can't go below 0), and **Report** (end-of-game retrospective with `ledger.csv` and `balances_by_turn.csv` attached, visible only to you) |
 
 ## Player Commands
 
@@ -55,5 +57,7 @@ Server Administrators can always see and use `/gm` commands regardless of the st
 |---|---|
 | `/orders` | Open the interactive orders builder for the current turn (add/remove/submit moves); usable only in your private `-orders` channel |
 | `/confessional` | Post a message, image, or voice note anonymously to `#confessional`; usable only from your private `-orders` channel |
-| `/gold` | Open your treasury panel: **Refresh Balance**, **Send Gold** (pick a faction, amount, optional note — sent privately and the recipient is DM'd), and **Transactions** |
+| Market post in `#town-square` | **Bet YES** / **Bet NO** stake gold on a market (up to your balance; add to a position or back both sides freely — eliminated players can't bet), **My Position** privately shows your stakes and projected payouts. The post shows live pool totals and implied odds but never who bet; staked gold is locked until the market is resolved or cancelled |
+| `/markets` | See every live market with its pools, links to its post, and your own stakes with projected payouts; pick an open market to **Bet YES** / **Bet NO** without scrolling back through `#town-square` |
+| `/gold` | Open your treasury panel (including how much gold is locked in unsettled markets): **Refresh Balance**, **Send Gold** (pick a faction, amount, optional note — sent privately and the recipient is DM'd), and **Transactions** |
 

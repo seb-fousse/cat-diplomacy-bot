@@ -35,3 +35,18 @@ async def _migrate():
         if column not in existing:
             print(f"[db] Adding confessional_log.{column} column")
             await conn.execute_script(statement)
+
+    _, rows = await conn.execute_query("PRAGMA table_info(gold_transactions)")
+    if not any(row["name"] == "market_event_id" for row in rows):
+        print("[db] Adding gold_transactions.market_event_id column")
+        await conn.execute_script(
+            'ALTER TABLE "gold_transactions" ADD COLUMN "market_event_id" INT '
+            'REFERENCES "market_events" ("id") ON DELETE SET NULL'
+        )
+
+    _, rows = await conn.execute_query("PRAGMA table_info(balance_snapshots)")
+    if not any(row["name"] == "locked" for row in rows):
+        print("[db] Adding balance_snapshots.locked column")
+        await conn.execute_script(
+            'ALTER TABLE "balance_snapshots" ADD COLUMN "locked" INT NOT NULL DEFAULT 0'
+        )
