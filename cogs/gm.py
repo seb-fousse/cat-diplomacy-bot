@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from tortoise import Tortoise
 from models import GameState, Player, Order
 
 
@@ -33,6 +34,9 @@ class GMCog(commands.Cog):
             return
 
         try:
+            print("[setup] Ensuring database schema...")
+            await Tortoise.generate_schemas()
+
             print("[setup] Creating roles...")
             roles = await self._create_roles(guild)
             await ctx.author.add_roles(roles["GM"])
@@ -394,6 +398,11 @@ class GMCog(commands.Cog):
                         failed.append(f"role @{role.name} (hierarchy — move bot role above it in Server Settings → Roles)")
                     except discord.HTTPException as e:
                         failed.append(f"role @{role.name} ({e})")
+
+            # Wipe DB records for this guild — Player deletion cascades to Order and ConfessionalLog
+            print("[teardown] Wiping database records...")
+            await GameState.filter(guild_id=guild.id).delete()
+            await Player.filter(guild_id=guild.id).delete()
 
             print("[teardown] Done.")
         except Exception as e:
