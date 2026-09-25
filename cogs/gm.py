@@ -81,41 +81,19 @@ class GMCog(commands.Cog):
             return f"❌ Setup failed: `{e}`"
 
     # -------------------------------------------------------------------------
-    # /gm set_turn
+    # /gm turn
     # -------------------------------------------------------------------------
 
-    @gm.command(name="set_turn", description="[GM] Set the current season and year")
+    @gm.command(name="turn", description="[GM] Manage the current turn and auto-close schedule")
     @commands.has_role("GM")
-    async def set_turn(
-        self,
-        ctx: discord.ApplicationContext,
-        season: discord.Option(str, "Current season", choices=["Spring", "Fall", "Winter"]),
-        year: discord.Option(int, "Current in-game year"),
-    ):
-        await ctx.defer(ephemeral=True)
-        state = await GameState.get_or_none(guild_id=ctx.guild.id)
-        if state:
-            # Lock in closing balances for the turn we're leaving
-            await economy.snapshot_balances(ctx.guild.id, state.season, state.year)
-            state.season = season
-            state.year = year
-            await state.save()
-        else:
-            await GameState.create(guild_id=ctx.guild.id, season=season, year=year)
+    async def turn(self, ctx: discord.ApplicationContext):
+        await ctx.respond(
+            content=await turn_panel_message(ctx.guild.id),
+            view=TurnView(ctx.guild.id),
+            ephemeral=True,
+        )
 
-        # Rename #current-map channel to #current-map-{season}-{year}
-        channel_name = f"current-map-{season.lower()}-{year}"
-        for channel in ctx.guild.text_channels:
-            if channel.name.startswith("current-map"):
-                try:
-                    await channel.edit(name=channel_name)
-                except discord.Forbidden:
-                    print(f"[set_turn] No permission to rename channel {channel.name}")
-                break
 
-        await ctx.followup.send(f"✅ Turn set to **{season} {year}**.", ephemeral=True)
-        
-    
     # -------------------------------------------------------------------------
     # Management actions — driven by the /gm manage panel
     # -------------------------------------------------------------------------
@@ -231,7 +209,7 @@ class GMCog(commands.Cog):
 
         state = await GameState.get_or_none(guild_id=ctx.guild.id)
         if not state:
-            await ctx.followup.send("⚠️ No turn has been set yet. Run `/gm set_turn` first.", ephemeral=True)
+            await ctx.followup.send("⚠️ No turn has been set yet. Run `/gm turn` first.", ephemeral=True)
             return
 
         # Query orders for current turn, prefetch players
@@ -281,60 +259,6 @@ class GMCog(commands.Cog):
             response = "\n".join(lines)
 
         await ctx.followup.send(response, ephemeral=True)
-
-    # -------------------------------------------------------------------------
-    # /gm set_close_schedule
-    # -------------------------------------------------------------------------
-
-    @gm.command(name="set_close_schedule", description="[GM] Set when orders automatically close (cron-style)")
-    @commands.has_role("GM")
-    async def set_close_schedule(
-        self,
-        ctx: discord.ApplicationContext,
-        days: discord.Option(str, "Days to close (comma-separated: MON,WED,FRI)"),
-        hour_utc: discord.Option(int, "Hour to close in UTC (0–23)"),
-        minute_utc: discord.Option(int, "Minute to close in UTC (0–59)", required=False, default=0),
-    ):
-        await ctx.defer(ephemeral=True)
-
-        state = await GameState.get_or_none(guild_id=ctx.guild.id)
-        if not state:
-            await ctx.followup.send("⚠️ No turn has been set yet. Run `/gm set_turn` first.", ephemeral=True)
-            return
-
-        # Validate hour and minute
-        if not (0 <= hour_utc <= 23):
-            await ctx.followup.send("❌ Hour must be between 0 and 23.", ephemeral=True)
-            return
-        if not (0 <= minute_utc <= 59):
-            await ctx.followup.send("❌ Minute must be between 0 and 59.", ephemeral=True)
-            return
-
-        # Normalize day names to uppercase
-        day_list = [d.strip().upper() for d in days.split(",")]
-        valid_days = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
-        invalid = [d for d in day_list if d not in valid_days]
-        if invalid:
-            await ctx.followup.send(f"❌ Invalid days: {', '.join(invalid)}. Use MON, TUE, WED, THU, FRI, SAT, SUN.", ephemeral=True)
-            return
-
-        # Save to GameState
-        state.close_weekdays = ",".join(sorted(set(day_list)))
-        state.close_hour_utc = hour_utc
-        state.close_minute_utc = minute_utc
-        await state.save()
-
-        # Update scheduled jobs in the turn manager
-        turn_manager = self.bot.get_cog("TurnManagerCog")
-        if turn_manager:
-            await turn_manager.reschedule_for_guild(ctx.guild.id)
-
-        day_names = ", ".join(state.close_weekdays.split(","))
-        time_str = f"{hour_utc:02d}:{minute_utc:02d}"
-        await ctx.followup.send(
-            f"✅ Orders will close every {day_names} at **{time_str} UTC**.",
-            ephemeral=True
-        )
 
     # -------------------------------------------------------------------------
     # /gm gold
@@ -499,6 +423,184 @@ class GMCog(commands.Cog):
         gm_cat = await guild.create_category("🎩 GM HQ", overwrites=overwrites)
         await guild.create_text_channel("gm-chat", category=gm_cat)
         await guild.create_text_channel("gm-commands", category=gm_cat)
+
+
+# ---------------------------------------------------------------------------
+# GM UI — /gm turn opens the turn control panel
+# ---------------------------------------------------------------------------
+
+SEASONS = ["Spring", "Fall", "Winter"]
+VALID_CLOSE_DAYS = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
+
+
+async def turn_panel_message(guild_id: int, notice: str = "") -> str:
+    header = f"{notice}\n\n" if notice else ""
+    state = await GameState.get_or_none(guild_id=guild_id)
+    if not state:
+        body = "*No turn has been set yet.* Press **Set Turn** to begin."
+    else:
+        body = f"**Current turn:** {state.season} {state.year}\n"
+        if state.close_weekdays and state.close_hour_utc is not None:
+            day_names = ", ".join(state.close_weekdays.split(","))
+            body += f"**Auto-close:** every {day_names} at {state.close_hour_utc:02d}:{state.close_minute_utc:02d} UTC"
+        else:
+            body += "**Auto-close:** not scheduled"
+    return f"{header}🗓️ **Turn Control**\n\n{body}"
+
+
+class TurnView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Set Turn", style=discord.ButtonStyle.success, emoji="🗓️")
+    async def set_turn(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        await interaction.response.send_modal(SetTurnModal(self.guild_id, state))
+
+    @discord.ui.button(label="Set Close Schedule", style=discord.ButtonStyle.primary, emoji="⏰")
+    async def set_close_schedule(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if not state:
+            await interaction.response.send_message(
+                "⚠️ Set the turn first before scheduling auto-close.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(SetCloseScheduleModal(self.guild_id, state))
+
+
+class SetTurnModal(discord.ui.DesignerModal):
+    def __init__(self, guild_id: int, state: GameState | None):
+        super().__init__(title="Set Turn")
+        self.guild_id = guild_id
+
+        self.season_label = discord.ui.Label(
+            label="Season",
+            item=discord.ui.Select(
+                select_type=discord.ComponentType.string_select,
+                placeholder="Choose a season...",
+                options=[
+                    discord.SelectOption(label=s, value=s, default=(state is not None and state.season == s))
+                    for s in SEASONS
+                ],
+            ),
+        )
+
+        self.year_label = discord.ui.Label(label="Year")
+        self.year_label.set_input_text(
+            placeholder="e.g.  1901",
+            max_length=6,
+            value=str(state.year) if state else None,
+        )
+
+        self.add_item(self.season_label)
+        self.add_item(self.year_label)
+
+    async def callback(self, interaction: discord.Interaction):
+        season = self.season_label.item.values[0]
+        raw_year = self.year_label.item.value.strip()
+        if not raw_year.isdigit():
+            await interaction.response.send_message(f"❌ `{raw_year}` isn't a valid year.", ephemeral=True)
+            return
+        year = int(raw_year)
+
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if state:
+            # Lock in closing balances for the turn we're leaving
+            await economy.snapshot_balances(self.guild_id, state.season, state.year)
+            state.season = season
+            state.year = year
+            await state.save()
+        else:
+            await GameState.create(guild_id=self.guild_id, season=season, year=year)
+
+        # Rename #current-map channel to #current-map-{season}-{year}
+        channel_name = f"current-map-{season.lower()}-{year}"
+        for channel in interaction.guild.text_channels:
+            if channel.name.startswith("current-map"):
+                try:
+                    await channel.edit(name=channel_name)
+                except discord.Forbidden:
+                    print(f"[set_turn] No permission to rename channel {channel.name}")
+                break
+
+        await interaction.response.edit_message(
+            content=await turn_panel_message(self.guild_id, f"✅ Turn set to **{season} {year}**."),
+            view=TurnView(self.guild_id),
+        )
+
+
+class SetCloseScheduleModal(discord.ui.DesignerModal):
+    def __init__(self, guild_id: int, state: GameState):
+        super().__init__(title="Set Close Schedule")
+        self.guild_id = guild_id
+
+        self.days_label = discord.ui.Label(label="Days to close (comma-separated)")
+        self.days_label.set_input_text(
+            placeholder="e.g.  MON,WED,FRI",
+            max_length=40,
+            value=state.close_weekdays or None,
+        )
+
+        self.hour_label = discord.ui.Label(label="Hour to close (UTC, 0–23)")
+        self.hour_label.set_input_text(
+            placeholder="e.g.  18",
+            max_length=2,
+            value=str(state.close_hour_utc) if state.close_hour_utc is not None else None,
+        )
+
+        self.minute_label = discord.ui.Label(label="Minute to close (UTC, 0–59)")
+        self.minute_label.set_input_text(
+            placeholder="e.g.  0",
+            max_length=2,
+            required=False,
+            value=str(state.close_minute_utc) if state.close_minute_utc is not None else "0",
+        )
+
+        self.add_item(self.days_label)
+        self.add_item(self.hour_label)
+        self.add_item(self.minute_label)
+
+    async def callback(self, interaction: discord.Interaction):
+        day_list = [d.strip().upper() for d in self.days_label.item.value.split(",")]
+        invalid = [d for d in day_list if d not in VALID_CLOSE_DAYS]
+        if invalid:
+            await interaction.response.send_message(
+                f"❌ Invalid days: {', '.join(invalid)}. Use MON, TUE, WED, THU, FRI, SAT, SUN.", ephemeral=True
+            )
+            return
+
+        raw_hour = self.hour_label.item.value.strip()
+        if not raw_hour.isdigit() or not (0 <= int(raw_hour) <= 23):
+            await interaction.response.send_message("❌ Hour must be between 0 and 23.", ephemeral=True)
+            return
+        hour_utc = int(raw_hour)
+
+        raw_minute = (self.minute_label.item.value or "0").strip() or "0"
+        if not raw_minute.isdigit() or not (0 <= int(raw_minute) <= 59):
+            await interaction.response.send_message("❌ Minute must be between 0 and 59.", ephemeral=True)
+            return
+        minute_utc = int(raw_minute)
+
+        state = await GameState.get(guild_id=self.guild_id)
+        state.close_weekdays = ",".join(sorted(set(day_list)))
+        state.close_hour_utc = hour_utc
+        state.close_minute_utc = minute_utc
+        await state.save()
+
+        # Update scheduled jobs in the turn manager
+        turn_manager = interaction.client.get_cog("TurnManagerCog")
+        if turn_manager:
+            await turn_manager.reschedule_for_guild(self.guild_id)
+
+        day_names = ", ".join(state.close_weekdays.split(","))
+        time_str = f"{hour_utc:02d}:{minute_utc:02d}"
+        await interaction.response.edit_message(
+            content=await turn_panel_message(
+                self.guild_id, f"✅ Orders will close every {day_names} at **{time_str} UTC**."
+            ),
+            view=TurnView(self.guild_id),
+        )
 
 
 # ---------------------------------------------------------------------------

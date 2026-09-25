@@ -44,8 +44,7 @@ Server Administrators can always see and use `/gm` commands regardless of the st
 | Command | Description |
 |---|---|
 | `/gm manage` | Open the management office: the player roster plus buttons for **Setup Server** (create roles and channels — run once before inviting players), **Add Player** (assign roles and create their private `-diplomacy` and `-orders` channels; bots can't be added), **Eliminate Player** (channels become read-only but aren't deleted), and **Teardown** (delete all bot-created channels and roles and wipe this server's game data — testing only, requires typing `teardown`). Buttons appear based on whether the server is set up |
-| `/gm set_turn` | Set the current season and year; renames the `#current-map` channel to match |
-| `/gm set_close_schedule` | Set a recurring cron-style schedule (days + UTC time) for when orders auto-close |
+| `/gm turn` | Open the turn control panel: **Set Turn** (season + year; renames the `#current-map` channel to match) and **Set Close Schedule** (recurring cron-style schedule — days + UTC time — for when orders auto-close) |
 | `/gm view_orders` | View all orders submitted so far for the current turn, grouped by faction |
 | `/gm speak` | Send a message as the Cat Diplomat, to `#town-square` or a specified channel |
 | `/gm gold` | Open the treasury office: leaderboard, a dropdown to inspect any player's ledger, **Adjust Gold** (grant or confiscate with a required reason; can't go below 0), and **Report** (end-of-game retrospective with `ledger.csv` and `balances_by_turn.csv` attached, visible only to you) |

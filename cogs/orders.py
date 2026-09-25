@@ -142,7 +142,7 @@ class OrdersView(discord.ui.View):
         game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
         if not game_state:
             await interaction.response.send_message(
-                "⚠️ The GM hasn't set the current turn yet. Ask them to run `/gm set_turn`.",
+                "⚠️ The GM hasn't set the current turn yet. Ask them to run `/gm turn`.",
                 ephemeral=True,
             )
             return
