@@ -298,11 +298,9 @@ async def markets_panel_message(player: Player, selected_id: int | None = None, 
         my_positions[pos.event_id].append(pos)
     locked = sum(p.amount for positions in my_positions.values() for p in positions)
 
-    eliminated_notice = "\n⚠️ **You are eliminated and cannot place new bets.**" if player.is_eliminated else ""
     lines = [
         f"{header}🎲 **Markets** — you hold **{player.gold_balance} gold**"
         + (f" · **{locked} gold** locked in markets" if locked else "")
-        + eliminated_notice
     ]
     if not events:
         lines.append("\n*No markets are open right now.*")
@@ -320,6 +318,9 @@ async def markets_panel_message(player: Player, selected_id: int | None = None, 
                 f"↳ *Your stake:* {SIDE_EMOJI[p.side]} {p.side} {p.amount} gold "
                 f"(~{_projected_payout(p.amount, p.side, pools)} back if {p.side} wins)"
             )
+    if player.is_eliminated:
+        lines.append("\n\u26a0\ufe0f **You are eliminated and cannot place new bets.**")
+
     # Discord trims trailing blank lines; a zero-width space keeps a gap above the dropdown
     return _truncate("\n".join(lines), 1990) + "\n\u200b"
 
