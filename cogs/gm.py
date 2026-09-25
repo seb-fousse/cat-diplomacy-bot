@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from models import GameState, Player
+from models import GameState, Player, Order
 
 
 class GMCog(commands.Cog):
@@ -74,6 +74,16 @@ class GMCog(commands.Cog):
             await state.save()
         else:
             await GameState.create(guild_id=ctx.guild.id, season=season, year=year)
+
+        # Rename #current-map channel to #current-map-{season}-{year}
+        channel_name = f"current-map-{season.lower()}-{year}"
+        for channel in ctx.guild.text_channels:
+            if channel.name.startswith("current-map"):
+                try:
+                    await channel.edit(name=channel_name)
+                except discord.Forbidden:
+                    print(f"[set_turn] No permission to rename channel {channel.name}")
+                break
 
         await ctx.followup.send(f"✅ Turn set to **{season} {year}**.", ephemeral=True)
         
@@ -202,6 +212,122 @@ class GMCog(commands.Cog):
         await ctx.followup.send(f"✅ Message sent to {channel.mention}.", ephemeral=True)
 
     # -------------------------------------------------------------------------
+    # /gm view_orders
+    # -------------------------------------------------------------------------
+
+    @gm.command(name="view_orders", description="[GM] View all submitted orders for the current turn")
+    @commands.has_role("GM")
+    async def view_orders(self, ctx: discord.ApplicationContext):
+        await ctx.defer(ephemeral=True)
+
+        state = await GameState.get_or_none(guild_id=ctx.guild.id)
+        if not state:
+            await ctx.followup.send("⚠️ No turn has been set yet. Run `/gm set_turn` first.", ephemeral=True)
+            return
+
+        # Query orders for current turn, prefetch players
+        orders = await Order.filter(
+            player__guild_id=ctx.guild.id,
+            season=state.season,
+            year=state.year,
+            status="submitted"
+        ).prefetch_related("player")
+
+        # Get all active players for comparison
+        all_players = await Player.filter(guild_id=ctx.guild.id, is_eliminated=False)
+        submitted_factions = {o.player.faction_name for o in orders}
+
+        if not orders and not all_players:
+            response = "**No players or orders yet.**"
+        else:
+            lines = [f"**Orders for {state.season} {state.year}:**\n"]
+
+            # Group orders by faction
+            faction_orders = {}
+            for order in orders:
+                faction = order.player.faction_name
+                if faction not in faction_orders:
+                    faction_orders[faction] = []
+                faction_orders[faction].append(order)
+
+            # Display submitted factions
+            for faction in sorted(faction_orders.keys()):
+                lines.append(f"🐱 **{faction}**")
+                for i, order in enumerate(faction_orders[faction], 1):
+                    if order.order_type == "HOLD":
+                        lines.append(f"{order.unit} — HOLDS")
+                    elif order.order_type == "MOVE":
+                        lines.append(f"{order.unit} — MOVE to {order.target}")
+                    else:
+                        lines.append(f"{order.unit} — {order.order_type} {order.target or ''}")
+                lines.append("")
+
+            # Display factions with no submissions
+            no_orders_factions = [p.faction_name for p in all_players if p.faction_name not in submitted_factions]
+            if no_orders_factions:
+                lines.append("⚠️ **No orders submitted:**")
+                for faction in sorted(no_orders_factions):
+                    lines.append(f"  — {faction}")
+
+            response = "\n".join(lines)
+
+        await ctx.followup.send(response, ephemeral=True)
+
+    # -------------------------------------------------------------------------
+    # /gm set_close_schedule
+    # -------------------------------------------------------------------------
+
+    @gm.command(name="set_close_schedule", description="[GM] Set when orders automatically close (cron-style)")
+    @commands.has_role("GM")
+    async def set_close_schedule(
+        self,
+        ctx: discord.ApplicationContext,
+        days: discord.Option(str, "Days to close (comma-separated: MON,WED,FRI)"),
+        hour_utc: discord.Option(int, "Hour to close in UTC (0–23)"),
+        minute_utc: discord.Option(int, "Minute to close in UTC (0–59)", required=False, default=0),
+    ):
+        await ctx.defer(ephemeral=True)
+
+        state = await GameState.get_or_none(guild_id=ctx.guild.id)
+        if not state:
+            await ctx.followup.send("⚠️ No turn has been set yet. Run `/gm set_turn` first.", ephemeral=True)
+            return
+
+        # Validate hour and minute
+        if not (0 <= hour_utc <= 23):
+            await ctx.followup.send("❌ Hour must be between 0 and 23.", ephemeral=True)
+            return
+        if not (0 <= minute_utc <= 59):
+            await ctx.followup.send("❌ Minute must be between 0 and 59.", ephemeral=True)
+            return
+
+        # Normalize day names to uppercase
+        day_list = [d.strip().upper() for d in days.split(",")]
+        valid_days = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
+        invalid = [d for d in day_list if d not in valid_days]
+        if invalid:
+            await ctx.followup.send(f"❌ Invalid days: {', '.join(invalid)}. Use MON, TUE, WED, THU, FRI, SAT, SUN.", ephemeral=True)
+            return
+
+        # Save to GameState
+        state.close_weekdays = ",".join(sorted(set(day_list)))
+        state.close_hour_utc = hour_utc
+        state.close_minute_utc = minute_utc
+        await state.save()
+
+        # Update scheduled jobs in the turn manager
+        turn_manager = self.bot.get_cog("TurnManagerCog")
+        if turn_manager:
+            await turn_manager.reschedule_for_guild(ctx.guild.id)
+
+        day_names = ", ".join(state.close_weekdays.split(","))
+        time_str = f"{hour_utc:02d}:{minute_utc:02d}"
+        await ctx.followup.send(
+            f"✅ Orders will close every {day_names} at **{time_str} UTC**.",
+            ephemeral=True
+        )
+
+    # -------------------------------------------------------------------------
     # /gm teardown  (testing only)
     # -------------------------------------------------------------------------
 
@@ -213,10 +339,10 @@ class GMCog(commands.Cog):
     async def teardown(
         self,
         ctx: discord.ApplicationContext,
-        confirm: discord.Option(str, 'Type "yes" to confirm — this deletes all channels and roles'),
+        confirm: discord.Option(str, 'Type "teardown" to confirm — this deletes all channels and roles'),
     ):
-        if confirm.lower() != "yes":
-            await ctx.respond("Teardown cancelled. Pass `yes` to confirm.", ephemeral=True)
+        if confirm.lower() != "teardown":
+            await ctx.respond("Teardown cancelled. Type `teardown` to confirm.", ephemeral=True)
             return
 
         await ctx.defer(ephemeral=True)

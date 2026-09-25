@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 from models import ConfessionalLog, Player
 
-
+# TODO: Time delay for confessional posts, configurable param in minutes
 class ConfessionalCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot

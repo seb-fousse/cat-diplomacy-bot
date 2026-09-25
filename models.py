@@ -40,6 +40,9 @@ class GameState(Model):
     guild_id   = fields.BigIntField(unique=True)
     season     = fields.CharField(max_length=20)   # Spring | Fall | Winter
     year       = fields.IntField()
+    close_weekdays = fields.CharField(max_length=100, null=True)  # "MON,WED,FRI" — comma-separated day abbreviations
+    close_hour_utc = fields.IntField(null=True)    # 0–23
+    close_minute_utc = fields.IntField(default=0)  # 0–59
     updated_at = fields.DatetimeField(auto_now=True)
 
     class Meta:

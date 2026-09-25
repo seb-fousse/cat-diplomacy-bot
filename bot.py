@@ -10,6 +10,7 @@ bot = discord.Bot(debug_guilds=[int(os.getenv("DEV_GUILD_ID"))])
 bot.load_extension("cogs.gm")
 bot.load_extension("cogs.orders")
 bot.load_extension("cogs.confessional")
+bot.load_extension("cogs.turn_manager")
 
 
 @bot.event

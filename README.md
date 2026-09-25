@@ -33,15 +33,18 @@ A Discord bot for running a cat-themed version of the board game [Diplomacy](htt
 
 | Command | Description |
 |---|---|
-| `/gm setup` | Initialise roles and channels — run once |
-| `/gm add_player` | Onboard a player and create their private channels |
-| `/gm set_turn` | Set the current season and year |
-| `/gm eliminate_player` | Eliminate a player from the game |
-| `/gm teardown` | Reset the server — testing only |
+| `/gm setup` | Initialise roles and channels — run once before inviting players |
+| `/gm add_player` | Onboard a player: assigns roles and creates their private `-diplomacy` and `-orders` channels |
+| `/gm eliminate_player` | Mark a player as eliminated (channels become read-only, but aren't deleted) |
+| `/gm set_turn` | Set the current season and year; renames the `#current-map` channel to match |
+| `/gm set_close_schedule` | Set a recurring cron-style schedule (days + UTC time) for when orders auto-close |
+| `/gm view_orders` | View all orders submitted so far for the current turn, grouped by faction |
+| `/gm speak` | Send a message as the Cat Diplomat, to `#town-square` or a specified channel |
+| `/gm teardown` | Delete all bot-created channels and roles, resetting the server — testing only |
 
 ## Player Commands
 
 | Command | Description |
 |---|---|
-| `/orders` | Open the orders builder for the current turn |
-| `/confessional` | Post anonymously to the confessional channel |
+| `/orders` | Open the interactive orders builder for the current turn (add/remove/submit moves); usable only in your private `-orders` channel |
+| `/confessional` | Post a message, image, or voice note anonymously to `#confessional`; usable only from your private `-orders` channel |
