@@ -199,66 +199,13 @@ class GMCog(commands.Cog):
         await ctx.followup.send(f"✅ Message sent to {channel.mention}.", ephemeral=True)
 
     # -------------------------------------------------------------------------
-    # /gm view_orders
+    # /gm orders
     # -------------------------------------------------------------------------
 
-    @gm.command(name="view_orders", description="[GM] View all submitted orders for the current turn")
+    @gm.command(name="orders", description="[GM] View all submitted orders for the current turn")
     @commands.has_role("GM")
-    async def view_orders(self, ctx: discord.ApplicationContext):
-        await ctx.defer(ephemeral=True)
-
-        state = await GameState.get_or_none(guild_id=ctx.guild.id)
-        if not state:
-            await ctx.followup.send("⚠️ No turn has been set yet. Run `/gm turn` first.", ephemeral=True)
-            return
-
-        # Query orders for current turn, prefetch players
-        orders = await Order.filter(
-            player__guild_id=ctx.guild.id,
-            season=state.season,
-            year=state.year,
-            status="submitted"
-        ).prefetch_related("player")
-
-        # Get all active players for comparison
-        all_players = await Player.filter(guild_id=ctx.guild.id, is_eliminated=False)
-        submitted_factions = {o.player.faction_name for o in orders}
-
-        if not orders and not all_players:
-            response = "**No players or orders yet.**"
-        else:
-            lines = [f"**Orders for {state.season} {state.year}:**\n"]
-
-            # Group orders by faction
-            faction_orders = {}
-            for order in orders:
-                faction = order.player.faction_name
-                if faction not in faction_orders:
-                    faction_orders[faction] = []
-                faction_orders[faction].append(order)
-
-            # Display submitted factions
-            for faction in sorted(faction_orders.keys()):
-                lines.append(f"🐱 **{faction}**")
-                for i, order in enumerate(faction_orders[faction], 1):
-                    if order.order_type == "HOLD":
-                        lines.append(f"{order.unit} — HOLDS")
-                    elif order.order_type == "MOVE":
-                        lines.append(f"{order.unit} — MOVE to {order.target}")
-                    else:
-                        lines.append(f"{order.unit} — {order.order_type} {order.target or ''}")
-                lines.append("")
-
-            # Display factions with no submissions
-            no_orders_factions = [p.faction_name for p in all_players if p.faction_name not in submitted_factions]
-            if no_orders_factions:
-                lines.append("⚠️ **No orders submitted:**")
-                for faction in sorted(no_orders_factions):
-                    lines.append(f"  — {faction}")
-
-            response = "\n".join(lines)
-
-        await ctx.followup.send(response, ephemeral=True)
+    async def orders(self, ctx: discord.ApplicationContext):
+        await ctx.respond(content=await orders_overview(ctx.guild.id), view=GMOrdersView(), ephemeral=True)
 
     # -------------------------------------------------------------------------
     # /gm gold
@@ -460,6 +407,66 @@ async def turn_panel_message(guild_id: int, notice: str = "") -> str:
         else:
             body += "**Auto-close:** not scheduled"
     return f"{header}🗓️ **Turn Control**\n\n{body}"
+
+
+async def orders_overview(guild_id: int) -> str:
+    state = await GameState.get_or_none(guild_id=guild_id)
+    if not state:
+        return "⚠️ No turn has been set yet. Run `/gm turn` first."
+
+    # Query orders for current turn, prefetch players
+    orders = await Order.filter(
+        player__guild_id=guild_id,
+        season=state.season,
+        year=state.year,
+        status="submitted"
+    ).prefetch_related("player")
+
+    # Get all active players for comparison
+    all_players = await Player.filter(guild_id=guild_id, is_eliminated=False)
+    submitted_factions = {o.player.faction_name for o in orders}
+
+    if not orders and not all_players:
+        return "**No players or orders yet.**"
+
+    lines = [f"**Orders for {state.season} {state.year}:**\n"]
+
+    # Group orders by faction
+    faction_orders = {}
+    for order in orders:
+        faction_orders.setdefault(order.player.faction_name, []).append(order)
+
+    # Display submitted factions
+    for faction in sorted(faction_orders.keys()):
+        lines.append(f"🐱 **{faction}**")
+        for order in faction_orders[faction]:
+            if order.order_type == "HOLD":
+                lines.append(f"{order.unit} — HOLDS")
+            elif order.order_type == "MOVE":
+                lines.append(f"{order.unit} — MOVE to {order.target}")
+            else:
+                lines.append(f"{order.unit} — {order.order_type} {order.target or ''}")
+        lines.append("")
+
+    # Display factions with no submissions
+    no_orders_factions = [p.faction_name for p in all_players if p.faction_name not in submitted_factions]
+    if no_orders_factions:
+        lines.append("⚠️ **No orders submitted:**")
+        for faction in sorted(no_orders_factions):
+            lines.append(f"  — {faction}")
+
+    return "\n".join(lines)
+
+
+class GMOrdersView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=await orders_overview(interaction.guild.id), view=GMOrdersView()
+        )
 
 
 class TurnView(discord.ui.View):
