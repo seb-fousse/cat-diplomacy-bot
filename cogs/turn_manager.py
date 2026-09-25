@@ -172,7 +172,7 @@ class TurnManagerCog(commands.Cog):
             try:
                 time_str = f"{state.close_hour_utc:02d}:{state.close_minute_utc:02d}"
                 await town_square.send(
-                    f"@everyone ⏰ Orders close in **1 hour** at **{time_str} UTC** for "
+                    f"@everyone ⏰ Orders close in **1 hour** at **{time_str}** for "
                     f"**{state.season} {state.year}**. Submit your orders now!"
                 )
             except Exception as e:

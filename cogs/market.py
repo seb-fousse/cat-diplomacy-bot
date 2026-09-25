@@ -6,7 +6,7 @@ from discord.ext import commands
 
 from models import GoldTransaction, MarketEvent, MarketPosition, Player
 from cogs import economy
-from cogs.economy import MARKET_SIDES, EconomyError
+from cogs.economy import MARKET_SIDES, EconomyError, code_table
 
 SIDE_EMOJI = {"YES": "🟢", "NO": "🔴"}
 STATUS_EMOJI = {"OPEN": "📈", "CLOSED": "🔒", "RESOLVED": "🏁", "CANCELLED": "🚫"}
@@ -404,16 +404,9 @@ async def gm_list_message(guild_id: int, notice: str = "") -> str:
             odds = [f"{pools[side] * 100 / total:.0f}%" if total else "—" for side in MARKET_SIDES]
             rows.append([STATUS_EMOJI[e.status], e.status, f"#{e.id}", _truncate(e.question, 28), str(total), *odds])
         # Every row, header included, starts with exactly one emoji, so emoji width shifts all rows equally
-        table = _code_table(["🎲", "Status", "#", "Market", "Gold", "YES", "NO"], rows, left={0, 1, 3})
+        table = code_table(["🎲", "Status", "#", "Market", "Gold", "YES", "NO"], rows, left={0, 1, 3})
         body = table + "\n*Pick a market below to see its breakdown and manage it.*"
     return _truncate(f"{header}🎲 **Market Office**\n\n{body}", 2000)
-
-
-def _code_table(headers: list[str], rows: list[list[str]], left: set[int]) -> str:
-    """Monospace table in a code block; columns in `left` are left-aligned, the rest right-aligned."""
-    widths = [max(len(r[i]) for r in [headers, *rows]) for i in range(len(headers))]
-    fmt = lambda r: "  ".join(c.ljust(widths[i]) if i in left else c.rjust(widths[i]) for i, c in enumerate(r))
-    return "```\n" + "\n".join([fmt(headers), *map(fmt, rows)]) + "\n```"
 
 
 def _positions_table(event: MarketEvent, positions: list[MarketPosition], pools: dict[str, int]) -> str:
@@ -439,7 +432,7 @@ def _positions_table(event: MarketEvent, positions: list[MarketPosition], pools:
             ]
         rows.append(row)
 
-    return _code_table(headers, rows, left={0})
+    return code_table(headers, rows, left={0})
 
 
 async def gm_detail_message(event: MarketEvent, notice: str = "") -> str:

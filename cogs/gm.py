@@ -264,11 +264,11 @@ class GMCog(commands.Cog):
     # /gm gold
     # -------------------------------------------------------------------------
 
-    @gm.command(name="gold", description="[GM] Open the treasury office — leaderboard, ledgers, adjustments")
+    @gm.command(name="gold", description="[GM] Open the treasury office — balances, ledgers, adjustments")
     @commands.has_role("GM")
     async def gold(self, ctx: discord.ApplicationContext):
         await ctx.respond(
-            content=await economy.gm_leaderboard_message(ctx.guild.id),
+            content=await economy.gm_overview_message(ctx.guild.id),
             view=await economy.GMGoldView.create(ctx.guild.id),
             ephemeral=True,
         )

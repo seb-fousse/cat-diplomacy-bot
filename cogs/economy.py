@@ -291,41 +291,53 @@ def _note(tx: GoldTransaction) -> str:
     return f' — "{text}"'
 
 
-def _market_text(tx: GoldTransaction) -> str:
-    text = tx.reason or "a market"
-    return text if len(text) <= 100 else text[:97] + "..."
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def describe_for_player(tx: GoldTransaction, viewer: Player) -> str:
-    turn = _turn_label(tx)
+def code_table(headers: list[str], rows: list[list[str]], left: set[int]) -> str:
+    """Monospace table in a code block; columns in `left` are left-aligned, the rest right-aligned."""
+    widths = [max(len(r[i]) for r in [headers, *rows]) for i in range(len(headers))]
+    fmt = lambda r: "  ".join(c.ljust(widths[i]) if i in left else c.rjust(widths[i]) for i, c in enumerate(r)).rstrip()
+    return "```\n" + "\n".join([fmt(headers), *map(fmt, rows)]) + "\n```"
+
+
+def _describe(tx: GoldTransaction, viewer: Player, gm: bool) -> str:
+    """What happened, from the viewer's side. The GM sees GM actions named plainly."""
     if tx.transaction_type == "MARKET_STAKE":
-        return f"`{turn}` −{tx.amount} bet {_market_text(tx)}"
-    if tx.transaction_type == "MARKET_PAYOUT":
-        return f"`{turn}` +{tx.amount} market winnings — {_market_text(tx)}"
-    if tx.transaction_type == "MARKET_REFUND":
-        return f"`{turn}` +{tx.amount} market refund — {_market_text(tx)}"
-    if tx.transaction_type == "TRANSFER":
-        if tx.from_player_id == viewer.id:
-            return f"`{turn}` −{tx.amount} to **{tx.to_player.faction_name}**{_note(tx)}"
-        return f"`{turn}` +{tx.amount} from **{tx.from_player.faction_name}**{_note(tx)}"
-    if tx.transaction_type == "GM_GRANT":
-        return f"`{turn}` +{tx.amount} from the Cat Diplomat{_note(tx)}"
-    return f"`{turn}` −{tx.amount} taken by the Cat Diplomat{_note(tx)}"
+        text = f"Bet {tx.reason or 'on a market'}"
+    elif tx.transaction_type == "MARKET_PAYOUT":
+        text = f"Winnings — {tx.reason or 'a market'}"
+    elif tx.transaction_type == "MARKET_REFUND":
+        text = f"Refund — {tx.reason or 'a market'}"
+    elif tx.transaction_type == "TRANSFER":
+        outgoing = tx.from_player_id == viewer.id
+        text = f"To {tx.to_player.faction_name}" if outgoing else f"From {tx.from_player.faction_name}"
+        text += f" — {tx.reason}" if tx.reason else ""
+    else:
+        granting = tx.transaction_type == "GM_GRANT"
+        if gm:
+            text = "GM grant" if granting else "GM deduct"
+        else:
+            text = "From the Cat Diplomat" if granting else "Taken by the Cat Diplomat"
+        text += f" — {tx.reason}" if tx.reason else ""
+    return _truncate(text, 40)
 
 
-def describe_for_gm(tx: GoldTransaction) -> str:
-    turn = _turn_label(tx)
-    if tx.transaction_type == "MARKET_STAKE":
-        return f"`{turn}` {tx.from_player.faction_name} bet **{tx.amount}** {_market_text(tx)}"
-    if tx.transaction_type == "MARKET_PAYOUT":
-        return f"`{turn}` Market winnings → {tx.to_player.faction_name}: **+{tx.amount}** — {_market_text(tx)}"
-    if tx.transaction_type == "MARKET_REFUND":
-        return f"`{turn}` Market refund → {tx.to_player.faction_name}: **+{tx.amount}** — {_market_text(tx)}"
-    if tx.transaction_type == "TRANSFER":
-        return f"`{turn}` {tx.from_player.faction_name} → {tx.to_player.faction_name}: **{tx.amount}**{_note(tx)}"
-    if tx.transaction_type == "GM_GRANT":
-        return f"`{turn}` GM grant → {tx.to_player.faction_name}: **+{tx.amount}**{_note(tx)}"
-    return f"`{turn}` GM deduct ← {tx.from_player.faction_name}: **−{tx.amount}**{_note(tx)}"
+def transactions_table(txs: list[GoldTransaction], viewer: Player, gm: bool = False) -> str:
+    if not txs:
+        return "*No transactions yet.*"
+    rows = []
+    for tx in txs:
+        outgoing = tx.from_player_id == viewer.id
+        after = tx.from_balance_after if outgoing else tx.to_balance_after
+        rows.append([
+            _turn_label(tx),
+            f"{'-' if outgoing else '+'}{tx.amount}",
+            "" if after is None else str(after),
+            _describe(tx, viewer, gm),
+        ])
+    return code_table(["Turn", "Gold", "Balance", "Details"], rows, left={0, 3})
 
 
 async def player_history(player: Player, limit: int = HISTORY_LIMIT) -> list[GoldTransaction]:
@@ -458,18 +470,21 @@ def _snapshots_csv(snapshots: list[BalanceSnapshot]) -> discord.File:
 # Player UI — /gold opens a treasury panel
 # ---------------------------------------------------------------------------
 
+async def _balance_lines(player: Player) -> str:
+    locked = (await locked_gold(player.guild_id))[player.id]
+    in_markets = f"\n🎲 balance locked up in markets - **{locked} gold**" if locked else ""
+    return f"💰 balance - **{player.gold_balance} gold**{in_markets}"
+
+
 async def _balance_message(player: Player, notice: str = "") -> str:
     frozen = "\n*Your treasury is frozen — you have been eliminated.*" if player.is_eliminated else ""
     header = f"{notice}\n\n" if notice else ""
-    locked = (await locked_gold(player.guild_id))[player.id]
-    in_markets = f"\n🎲 **{locked} gold** is locked in markets until they're settled — see `/markets`." if locked else ""
-    return f"{header}💰 **{player.faction_name}** holds **{player.gold_balance} gold**.{in_markets}{frozen}"
+    return f"{header}{await _balance_lines(player)}{frozen}"
 
 
 async def _history_message(player: Player) -> str:
-    txs = await player_history(player)
-    body = "\n".join(describe_for_player(t, player) for t in txs) or "*No transactions yet.*"
-    return f"📒 **{player.faction_name}** — {player.gold_balance} gold\n\n{body}"
+    table = transactions_table(await player_history(player), player)
+    return f"📒 **Transactions**\n{await _balance_lines(player)}\n{table}"
 
 
 class SendGoldModal(discord.ui.DesignerModal):
@@ -550,17 +565,21 @@ async def _notify_recipient(bot: discord.Client, recipient: Player, sender: Play
 
 
 class GoldView(discord.ui.View):
-    def __init__(self, player: Player):
+    def __init__(self, player: Player, history: bool = False):
         super().__init__(timeout=None)
         self.player_id = player.id
         self.send_gold.disabled = player.is_eliminated
+        self.transactions.disabled = history
+        if history:
+            self.balance.label, self.balance.emoji = "View Balance", "💰"
 
     async def _player(self) -> Player:
         return await Player.get(id=self.player_id)
 
-    @discord.ui.button(label="Refresh Balance", style=discord.ButtonStyle.primary, emoji="💰")
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, emoji="🔄")
     async def balance(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.edit_message(content=await _balance_message(await self._player()), view=self)
+        player = await self._player()
+        await interaction.response.edit_message(content=await _balance_message(player), view=GoldView(player))
 
     @discord.ui.button(label="Send Gold", style=discord.ButtonStyle.success, emoji="📤")
     async def send_gold(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -578,7 +597,10 @@ class GoldView(discord.ui.View):
 
     @discord.ui.button(label="Transactions", style=discord.ButtonStyle.secondary, emoji="📒")
     async def transactions(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.edit_message(content=await _history_message(await self._player()), view=self)
+        player = await self._player()
+        await interaction.response.edit_message(
+            content=await _history_message(player), view=GoldView(player, history=True)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -600,17 +622,28 @@ async def _all_players(guild_id: int) -> list[Player]:
     return await Player.filter(guild_id=guild_id).order_by("faction_name").limit(25)
 
 
-async def gm_leaderboard_message(guild_id: int, notice: str = "") -> str:
+async def gm_overview_message(guild_id: int, notice: str = "") -> str:
     header = f"{notice}\n\n" if notice else ""
-    return f"{header}🎩 **Treasury Office** — leaderboard\n\n{await leaderboard_text(guild_id)}"
+    players = await Player.filter(guild_id=guild_id).order_by("-gold_balance", "faction_name")
+    if not players:
+        body = "*No players yet.*"
+    else:
+        locked = await locked_gold(guild_id)
+        rows = [
+            [_truncate(p.faction_name, 24), _truncate(p.player_name or "unknown", 16),
+             str(p.gold_balance), str(locked[p.id]) if locked[p.id] else "", "out" if p.is_eliminated else ""]
+            for p in players
+        ]
+        body = code_table(["Faction", "Player", "Gold", "In markets", ""], rows, left={0, 1, 4})
+        body += "\n*Pick a player below to see their transactions.*"
+    return f"{header}🎩 **Treasury Office** — balances\n\n{body}"
 
 
 async def _gm_ledger_message(player: Player, notice: str = "") -> str:
     header = f"{notice}\n\n" if notice else ""
-    txs = await player_history(player)
-    body = "\n".join(describe_for_gm(t) for t in txs) or "*No transactions yet.*"
     status = " *(eliminated)*" if player.is_eliminated else ""
-    return f"{header}📒 **{player.faction_name}**{status} — {player.gold_balance} gold\n\n{body}"
+    table = transactions_table(await player_history(player), player, gm=True)
+    return f"{header}📒 **{player.faction_name}**{status}\n{await _balance_lines(player)}\n{table}"
 
 
 class AdjustGoldModal(discord.ui.DesignerModal):
@@ -681,7 +714,7 @@ class GMGoldView(discord.ui.View):
 
         if players:
             inspect = discord.ui.Select(
-                placeholder="Inspect a player's ledger...",
+                placeholder="Inspect player",
                 options=[_player_option(p, p.id == selected_id) for p in players],
                 row=0,
             )
@@ -689,6 +722,8 @@ class GMGoldView(discord.ui.View):
             self.add_item(inspect)
         else:
             self.adjust_gold.disabled = True
+        if selected_id is not None:
+            self.overview.label, self.overview.emoji = "Return to Overview", "⬅️"
 
     @classmethod
     async def create(cls, guild_id: int, selected_id: int | None = None) -> "GMGoldView":
@@ -704,10 +739,10 @@ class GMGoldView(discord.ui.View):
             view=await GMGoldView.create(self.guild_id, player.id),
         )
 
-    @discord.ui.button(label="Leaderboard", style=discord.ButtonStyle.primary, emoji="🏆", row=1)
-    async def leaderboard(self, button: discord.ui.Button, interaction: discord.Interaction):
+    @discord.ui.button(label="Refresh Balances", style=discord.ButtonStyle.primary, emoji="🔄", row=1)
+    async def overview(self, button: discord.ui.Button, interaction: discord.Interaction):
         await interaction.response.edit_message(
-            content=await gm_leaderboard_message(self.guild_id),
+            content=await gm_overview_message(self.guild_id),
             view=await GMGoldView.create(self.guild_id),
         )
 
