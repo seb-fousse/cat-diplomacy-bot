@@ -1,4 +1,5 @@
 import discord
+from apscheduler.triggers.cron import CronTrigger
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from discord.ext import commands
@@ -38,13 +39,38 @@ class Order:
         return f"{self.unit} — {self.order_type} {self.target}"
 
 
-def _orders_message(orders: list[Order], saved: list[Order], notice: str = "") -> str:
+def _deadline_line(game_state: GameState | None) -> str:
+    """Line describing when submissions close, or the closed/unset state."""
+    if game_state is None:
+        return "⚠️ *The GM hasn't set the current turn yet.*"
+    if game_state.turn_status == "closed":
+        return "🔒 **Submissions are closed for this turn.** Wait for the GM to advance to the next turn."
+    if not game_state.close_weekdays or game_state.close_hour is None:
+        return ""
+
+    trigger = CronTrigger(
+        day_of_week=game_state.close_weekdays.lower(),
+        hour=game_state.close_hour,
+        minute=game_state.close_minute or 0,
+        timezone=game_state.close_timezone or "UTC",
+    )
+    next_close = trigger.get_next_fire_time(None, datetime.now(timezone.utc))
+    if not next_close:
+        return ""
+    epoch = int(next_close.timestamp())
+    return f"⏰ Orders close <t:{epoch}:R> (<t:{epoch}:F>)."
+
+
+def _orders_message(
+    orders: list[Order], saved: list[Order], notice: str = "", deadline_line: str = ""
+) -> str:
     header = f"{notice}\n\n" if notice else ""
+    deadline = f"{deadline_line}\n\n" if deadline_line else ""
     status = "💾 *All changes saved.*" if orders == saved else "✏️ **Unsaved changes** — press **Save Orders** to keep them."
     if not orders:
-        return f"{header}*No orders yet.*\nUse **Add Order** to begin building your turn.\n\n{status}"
+        return f"{header}{deadline}*No orders yet.*\nUse **Add Order** to begin building your turn.\n\n{status}"
     body = "\n".join(f"{i}. {order}" for i, order in enumerate(orders, 1))
-    return f"{header}```\n{body}\n```\n{status}"
+    return f"{header}{deadline}```\n{body}\n```\n{status}"
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +162,12 @@ class OrdersView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if game_state.turn_status == "closed":
+            await interaction.response.send_message(
+                "⚠️ Submissions are closed for this turn. Wait for the GM to advance to the next turn.",
+                ephemeral=True,
+            )
+            return
 
         faction = interaction.channel.category.name.removeprefix("🐱 ")
 
@@ -193,14 +225,20 @@ class OrdersCog(commands.Cog):
         # Last-saved orders per user, for the unsaved-changes indicator
         self.saved_orders: dict[int, list[Order]] = {}
 
-    def panel(self, user_id: int, notice: str = "") -> tuple[str, OrdersView]:
+    def panel(
+        self, user_id: int, game_state: GameState | None = None, notice: str = ""
+    ) -> tuple[str, OrdersView]:
         content = _orders_message(
-            self.pending_orders.get(user_id, []), self.saved_orders.get(user_id, []), notice
+            self.pending_orders.get(user_id, []),
+            self.saved_orders.get(user_id, []),
+            notice,
+            _deadline_line(game_state),
         )
         return content, OrdersView(self, user_id)
 
     async def render(self, interaction: discord.Interaction, user_id: int, notice: str = ""):
-        content, view = self.panel(user_id, notice)
+        game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
+        content, view = self.panel(user_id, game_state, notice)
         await interaction.response.edit_message(content=content, view=view)
 
     @discord.slash_command(name="orders", description="Open the orders builder for this turn")
@@ -245,7 +283,7 @@ class OrdersCog(commands.Cog):
         self.saved_orders[ctx.author.id] = saved
         self.pending_orders[ctx.author.id] = list(saved)
 
-        content, view = self.panel(ctx.author.id)
+        content, view = self.panel(ctx.author.id, game_state)
         await ctx.respond(content=content, view=view, ephemeral=True)
 
 

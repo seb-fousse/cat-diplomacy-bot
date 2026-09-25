@@ -1,7 +1,10 @@
 import discord
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from datetime import timedelta
 from discord.ext import commands
+from tortoise import timezone
 from models import GameState, Player, Order
 from cogs import economy
 
@@ -11,6 +14,9 @@ WEEKDAY_PREVIOUS = {
     "MON": "sun", "TUE": "mon", "WED": "tue", "THU": "wed",
     "FRI": "thu", "SAT": "fri", "SUN": "sat",
 }
+
+OVERDUE_THRESHOLD = timedelta(hours=12)
+OVERDUE_CHECK_INTERVAL_MINUTES = 30
 
 
 class TurnManagerCog(commands.Cog):
@@ -23,6 +29,12 @@ class TurnManagerCog(commands.Cog):
         if not self.scheduler.running:
             self.scheduler.start()
         await self._load_all_schedules()
+        self.scheduler.add_job(
+            self._check_overdue_next_turn,
+            IntervalTrigger(minutes=OVERDUE_CHECK_INTERVAL_MINUTES),
+            id="overdue_next_turn_check",
+            replace_existing=True,
+        )
 
     async def _load_all_schedules(self):
         states = await GameState.filter(close_weekdays__isnull=False)
@@ -30,16 +42,17 @@ class TurnManagerCog(commands.Cog):
             self._schedule_jobs(state)
 
     def _schedule_jobs(self, state):
-        if not state.close_weekdays or state.close_hour_utc is None:
+        if not state.close_weekdays or state.close_hour is None:
             return
 
         weekdays = state.close_weekdays.lower()
-        close_hour = state.close_hour_utc
-        close_minute = state.close_minute_utc or 0
+        close_hour = state.close_hour
+        close_minute = state.close_minute or 0
+        tz = state.close_timezone or "UTC"
 
         self.scheduler.add_job(
-            self._close_orders_job,
-            CronTrigger(day_of_week=weekdays, hour=close_hour, minute=close_minute),
+            self._close_reminder_job,
+            CronTrigger(day_of_week=weekdays, hour=close_hour, minute=close_minute, timezone=tz),
             args=[state.guild_id],
             id=f"close_{state.guild_id}",
             replace_existing=True,
@@ -58,7 +71,7 @@ class TurnManagerCog(commands.Cog):
 
         self.scheduler.add_job(
             self._reminder_job,
-            CronTrigger(day_of_week=reminder_weekdays, hour=reminder_hour, minute=close_minute),
+            CronTrigger(day_of_week=reminder_weekdays, hour=reminder_hour, minute=close_minute, timezone=tz),
             args=[state.guild_id],
             id=f"reminder_{state.guild_id}",
             replace_existing=True,
@@ -78,22 +91,8 @@ class TurnManagerCog(commands.Cog):
         if state and state.close_weekdays:
             self._schedule_jobs(state)
 
-    async def _close_orders_job(self, guild_id):
-        state = await GameState.get_or_none(guild_id=guild_id)
-        if not state:
-            return
-
-        guild = self.bot.get_guild(guild_id)
-        if not guild:
-            return
-
-        # TODO(markets): remind the GM in #gm-commands of markets still open for betting when
-        # orders close, so a market isn't left open once its outcome is effectively known.
-        try:
-            await economy.snapshot_balances(guild_id, state.season, state.year)
-        except Exception as e:
-            print(f"[turn_manager] Failed to snapshot balances: {e}")
-
+    async def _missing_orders(self, guild_id, state):
+        """Active players who haven't submitted orders for the current turn."""
         all_active_players = await Player.filter(guild_id=guild_id, is_eliminated=False)
         orders = await Order.filter(
             player__guild_id=guild_id,
@@ -101,9 +100,50 @@ class TurnManagerCog(commands.Cog):
             year=state.year,
             status="submitted"
         ).prefetch_related("player")
-
         submitted_user_ids = {o.player.user_id for o in orders}
-        no_order_players = [p for p in all_active_players if p.user_id not in submitted_user_ids]
+        return [p for p in all_active_players if p.user_id not in submitted_user_ids], orders
+
+    async def _close_reminder_job(self, guild_id):
+        """Fires on the GM's configured schedule — nudges the GM to close manually rather
+        than closing automatically, since closing/advancing is now a GM-driven action."""
+        state = await GameState.get_or_none(guild_id=guild_id)
+        if not state or state.turn_status != "open":
+            return
+
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        no_order_players, _ = await self._missing_orders(guild_id, state)
+
+        gm_chat = discord.utils.get(guild.text_channels, name="gm-chat")
+        if gm_chat:
+            gm_role = discord.utils.get(guild.roles, name="GM")
+            mention = gm_role.mention if gm_role else "GM"
+            missing = (
+                ", ".join(p.faction_name for p in no_order_players)
+                if no_order_players else "none — all factions submitted"
+            )
+            try:
+                await gm_chat.send(
+                    f"{mention} ⏰ It's time to close submissions for **{state.season} {state.year}**.\n"
+                    f"Missing orders: {missing}.\n"
+                    f"Use `/gm turn` → **Close Submissions**."
+                )
+            except Exception as e:
+                print(f"[turn_manager] Failed to post close reminder: {e}")
+
+    async def close_submissions(self, guild: discord.Guild, state: GameState) -> str:
+        """Manually close order submissions for the current turn. Called from the GM
+        turn panel's Close Submissions button. Returns a summary for the panel notice."""
+        guild_id = guild.id
+
+        try:
+            await economy.snapshot_balances(guild_id, state.season, state.year)
+        except Exception as e:
+            print(f"[turn_manager] Failed to snapshot balances: {e}")
+
+        no_order_players, orders = await self._missing_orders(guild_id, state)
 
         # DM players who didn't submit
         for player in no_order_players:
@@ -116,15 +156,11 @@ class TurnManagerCog(commands.Cog):
             except Exception as e:
                 print(f"[turn_manager] Failed to DM user {player.user_id}: {e}")
 
-        time_str = f"{state.close_hour_utc:02d}:{state.close_minute_utc:02d}"
-
         # Post to #game-log
         game_log = discord.utils.get(guild.text_channels, name="game-log")
         if game_log:
             try:
-                await game_log.send(
-                    f"🔒 Orders closed for **{state.season} {state.year}** ({time_str} UTC)."
-                )
+                await game_log.send(f"🔒 Orders closed for **{state.season} {state.year}**.")
             except Exception as e:
                 print(f"[turn_manager] Failed to post to game-log: {e}")
 
@@ -158,6 +194,46 @@ class TurnManagerCog(commands.Cog):
             except Exception as e:
                 print(f"[turn_manager] Failed to post to public-orders: {e}")
 
+        state.turn_status = "closed"
+        state.closed_at = timezone.now()
+        state.next_turn_reminder_sent_at = None
+        await state.save()
+
+        if no_order_players:
+            missing = ", ".join(p.faction_name for p in no_order_players)
+            return f"🔒 Submissions closed for **{state.season} {state.year}**. Missing: {missing}."
+        return f"🔒 Submissions closed for **{state.season} {state.year}**. All factions submitted."
+
+    async def _check_overdue_next_turn(self):
+        """Runs every 30 minutes — nudges the GM chat if submissions have been closed for
+        12+ hours without the turn being advanced, repeating every 12h until it is."""
+        now = timezone.now()
+        states = await GameState.filter(turn_status="closed", closed_at__isnull=False)
+        for state in states:
+            last_ping = state.next_turn_reminder_sent_at or state.closed_at
+            if now - last_ping < OVERDUE_THRESHOLD:
+                continue
+
+            guild = self.bot.get_guild(state.guild_id)
+            if not guild:
+                continue
+
+            gm_chat = discord.utils.get(guild.text_channels, name="gm-chat")
+            if gm_chat:
+                hours = int((now - state.closed_at).total_seconds() // 3600)
+                gm_role = discord.utils.get(guild.roles, name="GM")
+                mention = gm_role.mention if gm_role else "GM"
+                try:
+                    await gm_chat.send(
+                        f"{mention} ⚠️ Submissions for **{state.season} {state.year}** have been "
+                        f"closed for **{hours}+ hours**. Don't forget to hit **Next Turn** in `/gm turn`!"
+                    )
+                except Exception as e:
+                    print(f"[turn_manager] Failed to post overdue reminder: {e}")
+
+            state.next_turn_reminder_sent_at = now
+            await state.save()
+
     async def _reminder_job(self, guild_id):
         state = await GameState.get_or_none(guild_id=guild_id)
         if not state:
@@ -170,9 +246,9 @@ class TurnManagerCog(commands.Cog):
         town_square = discord.utils.get(guild.text_channels, name="town-square")
         if town_square:
             try:
-                time_str = f"{state.close_hour_utc:02d}:{state.close_minute_utc:02d}"
+                time_str = f"{state.close_hour:02d}:{state.close_minute:02d}"
                 await town_square.send(
-                    f"@everyone ⏰ Orders close in **1 hour** at **{time_str}** for "
+                    f"@everyone ⏰ Orders close in **1 hour** at **{time_str} {state.close_timezone}** for "
                     f"**{state.season} {state.year}**. Submit your orders now!"
                 )
             except Exception as e:

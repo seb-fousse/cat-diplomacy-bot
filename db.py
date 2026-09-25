@@ -52,8 +52,28 @@ async def _migrate():
         )
 
     _, rows = await conn.execute_query("PRAGMA table_info(game_state)")
-    if not any(row["name"] == "markets_enabled" for row in rows):
-        print("[db] Adding game_state.markets_enabled column")
-        await conn.execute_script(
-            'ALTER TABLE "game_state" ADD COLUMN "markets_enabled" INT NOT NULL DEFAULT 0'
-        )
+    existing = {row["name"] for row in rows}
+
+    # close_hour_utc/close_minute_utc were renamed once the GM could pick a non-UTC timezone
+    renames = {
+        "close_hour_utc": "close_hour",
+        "close_minute_utc": "close_minute",
+    }
+    for old, new in renames.items():
+        if old in existing and new not in existing:
+            print(f"[db] Renaming game_state.{old} -> {new}")
+            await conn.execute_script(f'ALTER TABLE "game_state" RENAME COLUMN "{old}" TO "{new}"')
+            existing.discard(old)
+            existing.add(new)
+
+    game_state_columns = {
+        "markets_enabled": 'ALTER TABLE "game_state" ADD COLUMN "markets_enabled" INT NOT NULL DEFAULT 0',
+        "turn_status": 'ALTER TABLE "game_state" ADD COLUMN "turn_status" VARCHAR(10) NOT NULL DEFAULT \'open\'',
+        "closed_at": 'ALTER TABLE "game_state" ADD COLUMN "closed_at" TIMESTAMP',
+        "next_turn_reminder_sent_at": 'ALTER TABLE "game_state" ADD COLUMN "next_turn_reminder_sent_at" TIMESTAMP',
+        "close_timezone": 'ALTER TABLE "game_state" ADD COLUMN "close_timezone" VARCHAR(64) NOT NULL DEFAULT \'UTC\'',
+    }
+    for column, statement in game_state_columns.items():
+        if column not in existing:
+            print(f"[db] Adding game_state.{column} column")
+            await conn.execute_script(statement)

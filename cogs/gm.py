@@ -1,7 +1,9 @@
+import asyncio
 import os
 import discord
 from discord.ext import commands
-from tortoise import Tortoise
+from tortoise import Tortoise, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from models import GameState, GoldTransaction, MarketEvent, Player, Order
 from cogs import economy, market
 
@@ -84,12 +86,13 @@ class GMCog(commands.Cog):
     # /gm turn
     # -------------------------------------------------------------------------
 
-    @gm.command(name="turn", description="[GM] Manage the current turn and auto-close schedule")
+    @gm.command(name="turn", description="[GM] Manage the current turn, close submissions, and advance turns")
     @commands.has_role("GM")
     async def turn(self, ctx: discord.ApplicationContext):
+        state = await GameState.get_or_none(guild_id=ctx.guild.id)
         await ctx.respond(
             content=await turn_panel_message(ctx.guild.id),
-            view=TurnView(ctx.guild.id),
+            view=TurnView(ctx.guild.id, state),
             ephemeral=True,
         )
 
@@ -394,6 +397,42 @@ class GMCog(commands.Cog):
 
 SEASONS = ["Spring", "Fall", "Winter"]
 VALID_CLOSE_DAYS = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
+OVERDUE_HOURS = 12  # matches TurnManagerCog.OVERDUE_THRESHOLD
+
+
+def _next_season_year(season: str, year: int) -> tuple[str, int]:
+    idx = SEASONS.index(season)
+    if idx == len(SEASONS) - 1:
+        return SEASONS[0], year + 1
+    return SEASONS[idx + 1], year
+
+
+async def _rename_current_map_channel(guild: discord.Guild, season: str, year: int):
+    """Best-effort — always scheduled as a background task, never awaited before an interaction
+    response. Discord rate-limits channel renames to ~2 per 10 minutes and discord.py's HTTP
+    client sleeps through that limit rather than failing fast, which can take minutes — far
+    longer than the 3s window Discord gives an interaction to respond."""
+    channel_name = f"current-map-{season.lower()}-{year}"
+    for channel in guild.text_channels:
+        if channel.name.startswith("current-map"):
+            try:
+                await channel.edit(name=channel_name)
+            except Exception as e:
+                print(f"[turn] Could not rename channel {channel.name} -> {channel_name}: {e}")
+            break
+
+
+def _schedule_map_channel_rename(guild: discord.Guild, season: str, year: int):
+    asyncio.create_task(_rename_current_map_channel(guild, season, year))
+
+
+async def _post_turn_started(guild: discord.Guild, season: str, year: int):
+    game_log = discord.utils.get(guild.text_channels, name="game-log")
+    if game_log:
+        try:
+            await game_log.send(f"🗓️ **{season} {year}** has begun. Orders are now open.")
+        except Exception as e:
+            print(f"[turn] Failed to post turn-start to game-log: {e}")
 
 
 async def turn_panel_message(guild_id: int, notice: str = "") -> str:
@@ -403,11 +442,21 @@ async def turn_panel_message(guild_id: int, notice: str = "") -> str:
         body = "*No turn has been set yet.* Press **Set Turn** to begin."
     else:
         body = f"**Current turn:** {state.season} {state.year}\n"
-        if state.close_weekdays and state.close_hour_utc is not None:
-            day_names = ", ".join(state.close_weekdays.split(","))
-            body += f"**Auto-close:** every {day_names} at {state.close_hour_utc:02d}:{state.close_minute_utc:02d} UTC"
+        if state.turn_status == "closed" and state.closed_at:
+            elapsed_hours = (timezone.now() - state.closed_at).total_seconds() / 3600
+            body += f"**Status:** 🔒 Closed ({elapsed_hours:.1f}h ago)\n"
+            if elapsed_hours >= OVERDUE_HOURS:
+                body += "⚠️ **Overdue — hit Next Turn!**\n"
         else:
-            body += "**Auto-close:** not scheduled"
+            body += "**Status:** 🟢 Open for submissions\n"
+        if state.close_weekdays and state.close_hour is not None:
+            day_names = ", ".join(state.close_weekdays.split(","))
+            body += (
+                f"**Close reminder:** every {day_names} at "
+                f"{state.close_hour:02d}:{state.close_minute:02d} {state.close_timezone}"
+            )
+        else:
+            body += "**Close reminder:** not scheduled"
     return f"{header}🗓️ **Turn Control**\n\n{body}"
 
 
@@ -472,24 +521,70 @@ class GMOrdersView(discord.ui.View):
 
 
 class TurnView(discord.ui.View):
-    def __init__(self, guild_id: int):
+    def __init__(self, guild_id: int, state: GameState | None = None):
         super().__init__(timeout=None)
         self.guild_id = guild_id
+
+        # Only offer the actions that make sense for the current turn's status
+        if state is None or state.turn_status != "open":
+            self.remove_item(self.close_submissions)
+        if state is None or state.turn_status != "closed":
+            self.remove_item(self.next_turn)
 
     @discord.ui.button(label="Set Turn", style=discord.ButtonStyle.success, emoji="🗓️")
     async def set_turn(self, button: discord.ui.Button, interaction: discord.Interaction):
         state = await GameState.get_or_none(guild_id=self.guild_id)
         await interaction.response.send_modal(SetTurnModal(self.guild_id, state))
 
-    @discord.ui.button(label="Set Close Schedule", style=discord.ButtonStyle.primary, emoji="⏰")
+    @discord.ui.button(label="Set Reminder Schedule", style=discord.ButtonStyle.primary, emoji="⏰")
     async def set_close_schedule(self, button: discord.ui.Button, interaction: discord.Interaction):
         state = await GameState.get_or_none(guild_id=self.guild_id)
         if not state:
             await interaction.response.send_message(
-                "⚠️ Set the turn first before scheduling auto-close.", ephemeral=True
+                "⚠️ Set the turn first before scheduling close reminders.", ephemeral=True
             )
             return
         await interaction.response.send_modal(SetCloseScheduleModal(self.guild_id, state))
+
+    @discord.ui.button(label="Close Submissions", style=discord.ButtonStyle.danger, emoji="🔒")
+    async def close_submissions(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if not state or state.turn_status != "open":
+            await interaction.response.send_message("⚠️ Submissions are already closed.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        turn_manager = interaction.client.get_cog("TurnManagerCog")
+        summary = await turn_manager.close_submissions(interaction.guild, state)
+        await interaction.edit_original_response(
+            content=await turn_panel_message(self.guild_id, summary),
+            view=TurnView(self.guild_id, state),
+        )
+
+    @discord.ui.button(label="Next Turn", style=discord.ButtonStyle.success, emoji="⏭️")
+    async def next_turn(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if not state or state.turn_status != "closed":
+            await interaction.response.send_message(
+                "⚠️ Close submissions before advancing to the next turn.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+
+        season, year = _next_season_year(state.season, state.year)
+        state.season = season
+        state.year = year
+        state.turn_status = "open"
+        state.closed_at = None
+        state.next_turn_reminder_sent_at = None
+        await state.save()
+
+        await _post_turn_started(interaction.guild, season, year)
+
+        await interaction.edit_original_response(
+            content=await turn_panel_message(self.guild_id, f"✅ Advanced to **{season} {year}**."),
+            view=TurnView(self.guild_id, state),
+        )
+        _schedule_map_channel_rename(interaction.guild, season, year)
 
 
 class SetTurnModal(discord.ui.DesignerModal):
@@ -527,62 +622,68 @@ class SetTurnModal(discord.ui.DesignerModal):
             return
         year = int(raw_year)
 
+        await interaction.response.defer()
+
         state = await GameState.get_or_none(guild_id=self.guild_id)
         if state:
             # Lock in closing balances for the turn we're leaving
             await economy.snapshot_balances(self.guild_id, state.season, state.year)
             state.season = season
             state.year = year
+            state.turn_status = "open"
+            state.closed_at = None
+            state.next_turn_reminder_sent_at = None
             await state.save()
         else:
-            await GameState.create(guild_id=self.guild_id, season=season, year=year)
+            state = await GameState.create(guild_id=self.guild_id, season=season, year=year)
 
-        # Rename #current-map channel to #current-map-{season}-{year}
-        channel_name = f"current-map-{season.lower()}-{year}"
-        for channel in interaction.guild.text_channels:
-            if channel.name.startswith("current-map"):
-                try:
-                    await channel.edit(name=channel_name)
-                except discord.Forbidden:
-                    print(f"[set_turn] No permission to rename channel {channel.name}")
-                break
+        await _post_turn_started(interaction.guild, season, year)
 
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=await turn_panel_message(self.guild_id, f"✅ Turn set to **{season} {year}**."),
-            view=TurnView(self.guild_id),
+            view=TurnView(self.guild_id, state),
         )
+        _schedule_map_channel_rename(interaction.guild, season, year)
 
 
 class SetCloseScheduleModal(discord.ui.DesignerModal):
     def __init__(self, guild_id: int, state: GameState):
-        super().__init__(title="Set Close Schedule")
+        super().__init__(title="Set Reminder Schedule")
         self.guild_id = guild_id
 
-        self.days_label = discord.ui.Label(label="Days to close (comma-separated)")
+        self.days_label = discord.ui.Label(label="Reminder days (comma-separated)")
         self.days_label.set_input_text(
             placeholder="e.g.  MON,WED,FRI",
             max_length=40,
             value=state.close_weekdays or None,
         )
 
-        self.hour_label = discord.ui.Label(label="Hour to close (UTC, 0–23)")
+        self.hour_label = discord.ui.Label(label="Reminder hour [0-23]")
         self.hour_label.set_input_text(
             placeholder="e.g.  18",
             max_length=2,
-            value=str(state.close_hour_utc) if state.close_hour_utc is not None else None,
+            value=str(state.close_hour) if state.close_hour is not None else None,
         )
 
-        self.minute_label = discord.ui.Label(label="Minute to close (UTC, 0–59)")
+        self.minute_label = discord.ui.Label(label="Reminder minute [0-59]")
         self.minute_label.set_input_text(
             placeholder="e.g.  0",
             max_length=2,
             required=False,
-            value=str(state.close_minute_utc) if state.close_minute_utc is not None else "0",
+            value=str(state.close_minute) if state.close_minute is not None else "0",
+        )
+
+        self.timezone_label = discord.ui.Label(label="Timezone (IANA name)")
+        self.timezone_label.set_input_text(
+            placeholder="e.g.  America/New_York  |  Europe/London  |  UTC",
+            max_length=64,
+            value=state.close_timezone or "UTC",
         )
 
         self.add_item(self.days_label)
         self.add_item(self.hour_label)
         self.add_item(self.minute_label)
+        self.add_item(self.timezone_label)
 
     async def callback(self, interaction: discord.Interaction):
         day_list = [d.strip().upper() for d in self.days_label.item.value.split(",")]
@@ -597,18 +698,30 @@ class SetCloseScheduleModal(discord.ui.DesignerModal):
         if not raw_hour.isdigit() or not (0 <= int(raw_hour) <= 23):
             await interaction.response.send_message("❌ Hour must be between 0 and 23.", ephemeral=True)
             return
-        hour_utc = int(raw_hour)
+        hour = int(raw_hour)
 
         raw_minute = (self.minute_label.item.value or "0").strip() or "0"
         if not raw_minute.isdigit() or not (0 <= int(raw_minute) <= 59):
             await interaction.response.send_message("❌ Minute must be between 0 and 59.", ephemeral=True)
             return
-        minute_utc = int(raw_minute)
+        minute = int(raw_minute)
+
+        raw_timezone = self.timezone_label.item.value.strip()
+        try:
+            ZoneInfo(raw_timezone)
+        except ZoneInfoNotFoundError:
+            await interaction.response.send_message(
+                f"❌ Unknown timezone `{raw_timezone}`. Use an IANA name like `America/New_York`, "
+                f"`Europe/London`, or `UTC`.",
+                ephemeral=True,
+            )
+            return
 
         state = await GameState.get(guild_id=self.guild_id)
         state.close_weekdays = ",".join(sorted(set(day_list)))
-        state.close_hour_utc = hour_utc
-        state.close_minute_utc = minute_utc
+        state.close_hour = hour
+        state.close_minute = minute
+        state.close_timezone = raw_timezone
         await state.save()
 
         # Update scheduled jobs in the turn manager
@@ -617,12 +730,14 @@ class SetCloseScheduleModal(discord.ui.DesignerModal):
             await turn_manager.reschedule_for_guild(self.guild_id)
 
         day_names = ", ".join(state.close_weekdays.split(","))
-        time_str = f"{hour_utc:02d}:{minute_utc:02d}"
+        time_str = f"{hour:02d}:{minute:02d}"
         await interaction.response.edit_message(
             content=await turn_panel_message(
-                self.guild_id, f"✅ Orders will close every {day_names} at **{time_str} UTC**."
+                self.guild_id,
+                f"✅ The GM will be reminded to close submissions every {day_names} at "
+                f"**{time_str} {raw_timezone}**.",
             ),
-            view=TurnView(self.guild_id),
+            view=TurnView(self.guild_id, state),
         )
 
 

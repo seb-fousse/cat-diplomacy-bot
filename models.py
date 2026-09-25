@@ -42,9 +42,13 @@ class GameState(Model):
     season     = fields.CharField(max_length=20)   # Spring | Fall | Winter
     year       = fields.IntField()
     close_weekdays = fields.CharField(max_length=100, null=True)  # "MON,WED,FRI" — comma-separated day abbreviations
-    close_hour_utc = fields.IntField(null=True)    # 0–23
-    close_minute_utc = fields.IntField(default=0)  # 0–59
+    close_hour   = fields.IntField(null=True)    # 0-23, local to close_timezone
+    close_minute = fields.IntField(default=0)    # 0-59, local to close_timezone
+    close_timezone = fields.CharField(max_length=64, default="UTC")  # IANA name, e.g. "America/New_York"
     markets_enabled = fields.BooleanField(default=False)  # gates the player-facing /markets command
+    turn_status = fields.CharField(max_length=10, default="open")  # open | closed — GM-controlled, not auto-advanced
+    closed_at = fields.DatetimeField(null=True)  # when the GM manually closed submissions for the current turn
+    next_turn_reminder_sent_at = fields.DatetimeField(null=True)  # last time the "advance the turn" nudge fired
     updated_at = fields.DatetimeField(auto_now=True)
 
     class Meta:
