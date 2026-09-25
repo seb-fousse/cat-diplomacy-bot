@@ -7,6 +7,9 @@
 *.db-shm
 *.db-wal
 
+# Pending confessional attachments (saved to disk while awaiting delayed posting)
+data/
+
 # Python
 __pycache__/
 *.py[cod]

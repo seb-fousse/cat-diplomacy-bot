@@ -51,11 +51,16 @@ class GameState(Model):
 
 
 class ConfessionalLog(Model):
-    id             = fields.IntField(pk=True)
-    player         = fields.ForeignKeyField("models.Player", related_name="confessional_logs", null=True)
-    message        = fields.TextField(null=True)
-    attachment_url = fields.CharField(max_length=500, null=True)
-    posted_at      = fields.DatetimeField(auto_now_add=True)
+    id                  = fields.IntField(pk=True)
+    player              = fields.ForeignKeyField("models.Player", related_name="confessional_logs", null=True)
+    guild_id            = fields.BigIntField(null=True)
+    message             = fields.TextField(null=True)
+    attachment_url      = fields.CharField(max_length=500, null=True)
+    attachment_path     = fields.CharField(max_length=500, null=True)  # local file, kept while a delayed post is pending
+    attachment_filename = fields.CharField(max_length=255, null=True)
+    status              = fields.CharField(max_length=20, default="posted")  # pending | posted | cancelled
+    scheduled_for       = fields.DatetimeField(null=True)
+    posted_at           = fields.DatetimeField(auto_now_add=True)
 
     class Meta:
         table = "confessional_log"

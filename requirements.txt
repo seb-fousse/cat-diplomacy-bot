@@ -1,4 +1,4 @@
-py-cord==2.6.1
+py-cord==2.7.2
 python-dotenv==1.0.1
 aiosqlite==0.20.0
 tortoise-orm==0.21.7
