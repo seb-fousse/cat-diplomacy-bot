@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 from collections import defaultdict
 
 import discord
@@ -26,6 +27,15 @@ async def _pools(event_id: int) -> dict[str, int]:
     return pools
 
 
+def _percent_bar(pools: dict[str, int]) -> str:
+    """10-block bar of the YES/NO split, rounded to the nearest 10%; grey when nobody has bet yet."""
+    total = sum(pools.values())
+    if not total:
+        return "⬜" * 10
+    yes_blocks = min(10, max(0, round(pools["YES"] * 10 / total)))
+    return "🟩" * yes_blocks + "🟥" * (10 - yes_blocks)
+
+
 def _pool_lines(pools: dict[str, int]) -> list[str]:
     total = sum(pools.values())
     lines = []
@@ -38,6 +48,7 @@ def _pool_lines(pools: dict[str, int]) -> list[str]:
         else:
             odds = f"{amount * 100 / total:.0f}% · pays {total / amount:.2f}×"
         lines.append(f"{SIDE_EMOJI[side]} **{side}** — {amount} gold · {odds}")
+    lines.append(_percent_bar(pools))
     lines.append(f"💰 **Total pool:** {total} gold")
     return lines
 
@@ -209,7 +220,19 @@ class BetModal(discord.ui.DesignerModal):
         try:
             position = await economy.stake(player, self.event_id, self.side, amount, initiated_by=interaction.user.id)
         except EconomyError as e:
-            await interaction.response.send_message(f"❌ {e} You have **{player.gold_balance} gold**.", ephemeral=True)
+            if str(e) == "Insufficient gold.":
+                msg = f"❌ Insufficient gold — you bet **{amount}** but only have **{player.gold_balance} gold**."
+            else:
+                msg = f"❌ {e} You have **{player.gold_balance} gold**."
+            await interaction.response.send_message(msg, ephemeral=True)
+            return
+        except Exception:
+            print(f"[market] Unexpected error placing bet for {player.faction_name} (market {self.event_id}):")
+            traceback.print_exc()
+            await interaction.response.send_message(
+                "❌ Something went wrong placing that bet and your gold wasn't touched. Please try again.",
+                ephemeral=True,
+            )
             return
 
         print(f"[market] {player.faction_name} bet {amount} on {self.side} (market {self.event_id})")
