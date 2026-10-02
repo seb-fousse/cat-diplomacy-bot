@@ -17,6 +17,20 @@ def format_order(order) -> str:
     return f"{order.unit} — {order.order_type} {order.target or ''}"
 
 
+def page_slice(items: list, page: int, per_page: int) -> tuple[list, int, int]:
+    """One page of `items`, plus the page index clamped into range and the total page count.
+    An empty list is one empty page, so a caller always has something to render."""
+    total_pages = max(1, -(-len(items) // per_page))
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    return items[start : start + per_page], page, total_pages
+
+
+def page_label(page: int, total_pages: int) -> str:
+    """Suffix for a paged heading, empty when everything fits on one page."""
+    return f" · page {page + 1} of {total_pages}" if total_pages > 1 else ""
+
+
 def _split_oversized(block: str, limit: int) -> list[str]:
     """Last resort for a single block that doesn't fit: split it on line boundaries,
     and mid-line only for a line that is itself longer than the limit."""

@@ -2,6 +2,8 @@ import csv
 import io
 import logging
 from collections import defaultdict
+from datetime import datetime, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord.ext import commands
@@ -11,12 +13,12 @@ from tortoise.transactions import in_transaction
 
 from models import BalanceSnapshot, GameState, GoldTransaction, MarketEvent, MarketPosition, Player
 import cogs.orders  # noqa: F401 — applies the pycord patch that makes optional modal inputs work
-from formatting import truncate
+from formatting import DISCORD_MESSAGE_LIMIT, page_label, page_slice, truncate
 
 log = logging.getLogger(__name__)
 
 SEASON_ORDER = {"Spring": 0, "Fall": 1, "Winter": 2}
-HISTORY_LIMIT = 15
+HISTORY_PAGE_SIZE = 15  # transactions shown per page
 MARKET_SIDES = ("YES", "NO")
 
 
@@ -330,26 +332,56 @@ def _describe(tx: GoldTransaction, viewer: Player, gm: bool) -> str:
     return truncate(text, 40)
 
 
-def transactions_table(txs: list[GoldTransaction], viewer: Player, gm: bool = False) -> str:
+async def display_timezone(guild_id: int) -> tzinfo:
+    """The timezone the GM already told us they think in, via the turn reminder schedule.
+    Discord exposes no per-user timezone, so a configured zone is the closest we get to
+    local time inside a monospace table — <t:...> markup isn't parsed in a code block."""
+    state = await GameState.get_or_none(guild_id=guild_id)
+    name = (state.close_timezone if state else None) or "UTC"
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning(f"Unknown close_timezone {name!r} on guild {guild_id} — showing times in UTC")
+        return ZoneInfo("UTC")
+
+
+def transactions_table(
+    txs: list[GoldTransaction], viewer: Player, gm: bool = False, tz: tzinfo | None = None
+) -> str:
+    """Passing `tz` adds a leftmost timestamp column rendered in that zone. Only the GM's
+    ledger does; a player's own panel stays as it was."""
     if not txs:
         return "*No transactions yet.*"
     rows = []
     for tx in txs:
         outgoing = tx.from_player_id == viewer.id
         after = tx.from_balance_after if outgoing else tx.to_balance_after
-        rows.append([
+        row = [
             _turn_label(tx),
             f"{'-' if outgoing else '+'}{tx.amount}",
             "" if after is None else str(after),
             _describe(tx, viewer, gm),
-        ])
-    return code_table(["Turn", "Gold", "Balance", "Details"], rows, left={0, 3})
+        ]
+        if tz is not None:
+            row.insert(0, tx.created_at.astimezone(tz).strftime("%m-%d %H:%M"))
+        rows.append(row)
+
+    headers = ["Turn", "Gold", "Balance", "Details"]
+    left = {0, 3}
+    if tz is not None:
+        # The abbreviation keeps a bare MM-DD HH:MM from being ambiguous, and costs no
+        # width — the column is already as wide as its values
+        headers.insert(0, f"When ({datetime.now(tz).strftime('%Z')})")
+        left = {0, 1, 4}
+    return code_table(headers, rows, left=left)
 
 
-async def player_history(player: Player, limit: int = HISTORY_LIMIT) -> list[GoldTransaction]:
+async def player_history(player: Player) -> list[GoldTransaction]:
+    """Every transaction this player was party to, newest first. Paged for display rather
+    than cut off, so the whole ledger stays reachable from the panels."""
     sent = await GoldTransaction.filter(from_player=player).prefetch_related("from_player", "to_player")
     received = await GoldTransaction.filter(to_player=player).prefetch_related("from_player", "to_player")
-    return sorted(sent + received, key=lambda t: t.id, reverse=True)[:limit]
+    return sorted(sent + received, key=lambda t: t.id, reverse=True)
 
 
 async def resolve_player(guild_id: int, value: str) -> Player | None:
@@ -488,9 +520,12 @@ async def _balance_message(player: Player, notice: str = "") -> str:
     return f"{header}{await _balance_lines(player)}{frozen}"
 
 
-async def _history_message(player: Player) -> str:
-    table = transactions_table(await player_history(player), player)
-    return f"📒 **Transactions**\n{await _balance_lines(player)}\n{table}"
+async def history_panel(player: Player, page: int = 0) -> tuple[str, "GoldView"]:
+    """The player's own transaction page, with the matching button state."""
+    rows, page, total_pages = page_slice(await player_history(player), page, HISTORY_PAGE_SIZE)
+    heading = f"📒 **Transactions**{page_label(page, total_pages)}"
+    content = f"{heading}\n{await _balance_lines(player)}\n{transactions_table(rows, player)}"
+    return content, GoldView(player, history=True, page=page, total_pages=total_pages)
 
 
 class SendGoldModal(discord.ui.DesignerModal):
@@ -571,14 +606,23 @@ async def _notify_recipient(bot: discord.Client, recipient: Player, sender: Play
 
 
 class GoldView(discord.ui.View):
-    def __init__(self, player: Player, history: bool = False):
+    def __init__(self, player: Player, history: bool = False, page: int = 0, total_pages: int = 1):
         super().__init__(timeout=None)
         self.player_id = player.id
+        self.page = page
         # Nothing to send with an empty treasury, so don't offer the button at all
         self.send_gold.disabled = player.is_eliminated or player.gold_balance <= 0
         self.transactions.disabled = history
         if history:
             self.balance.label, self.balance.emoji = "View Balance", "💰"
+
+        # Page controls belong to the transaction view, and only once there's a second page
+        if history and total_pages > 1:
+            self.previous_page.disabled = page == 0
+            self.next_page.disabled = page >= total_pages - 1
+        else:
+            self.remove_item(self.previous_page)
+            self.remove_item(self.next_page)
 
     async def _player(self) -> Player:
         return await Player.get(id=self.player_id)
@@ -604,10 +648,19 @@ class GoldView(discord.ui.View):
 
     @discord.ui.button(label="Transactions", style=discord.ButtonStyle.secondary, emoji="📒")
     async def transactions(self, button: discord.ui.Button, interaction: discord.Interaction):
-        player = await self._player()
-        await interaction.response.edit_message(
-            content=await _history_message(player), view=GoldView(player, history=True)
-        )
+        await self._show_history(interaction, 0)
+
+    async def _show_history(self, interaction: discord.Interaction, page: int):
+        content, view = await history_panel(await self._player(), page)
+        await interaction.response.edit_message(content=content, view=view)
+
+    @discord.ui.button(label="Newer", style=discord.ButtonStyle.secondary, emoji="◀️", row=1)
+    async def previous_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show_history(interaction, self.page - 1)
+
+    @discord.ui.button(label="Older", style=discord.ButtonStyle.secondary, emoji="▶️", row=1)
+    async def next_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show_history(interaction, self.page + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -643,14 +696,23 @@ async def gm_overview_message(guild_id: int, notice: str = "") -> str:
         ]
         body = code_table(["Faction", "Player", "Gold", "In markets", ""], rows, left={0, 1, 4})
         body += "\n*Pick a player below to see their transactions.*"
-    return f"{header}🎩 **Treasury Office** — balances\n\n{body}"
+    # Bounded by the roster rather than the game's length, so a cap is enough here
+    return truncate(f"{header}🎩 **Treasury Office** — balances\n\n{body}", DISCORD_MESSAGE_LIMIT)
 
 
-async def _gm_ledger_message(player: Player, notice: str = "") -> str:
+async def gm_ledger_panel(
+    guild_id: int, player: Player, page: int = 0, notice: str = ""
+) -> tuple[str, "GMGoldView"]:
+    """One player's ledger page as the GM sees it, with the matching button state."""
+    rows, page, total_pages = page_slice(await player_history(player), page, HISTORY_PAGE_SIZE)
     header = f"{notice}\n\n" if notice else ""
     status = " *(eliminated)*" if player.is_eliminated else ""
-    table = transactions_table(await player_history(player), player, gm=True)
-    return f"{header}📒 **{player.faction_name}**{status}\n{await _balance_lines(player)}\n{table}"
+    heading = f"📒 **{player.faction_name}**{status}{page_label(page, total_pages)}"
+    content = (
+        f"{header}{heading}\n{await _balance_lines(player)}\n"
+        f"{transactions_table(rows, player, gm=True, tz=await display_timezone(guild_id))}"
+    )
+    return content, await GMGoldView.create(guild_id, player.id, page, total_pages)
 
 
 class AdjustGoldModal(discord.ui.DesignerModal):
@@ -705,19 +767,35 @@ class AdjustGoldModal(discord.ui.DesignerModal):
 
         log.info(f"GM adjust {player.faction_name}: {amount:+} (tx {tx.id}) — {reason}")
         await player.refresh_from_db()
-        await interaction.response.edit_message(
-            content=await _gm_ledger_message(
-                player, f"✅ **{player.faction_name}** {amount:+} gold → now **{player.gold_balance} gold**."
-            ),
-            view=await GMGoldView.create(self.guild_id, player.id),
+        content, view = await gm_ledger_panel(
+            self.guild_id, player,
+            notice=f"✅ **{player.faction_name}** {amount:+} gold → now **{player.gold_balance} gold**.",
         )
+        await interaction.response.edit_message(content=content, view=view)
 
 
 class GMGoldView(discord.ui.View):
-    def __init__(self, guild_id: int, players: list[Player], selected_id: int | None):
+    def __init__(
+        self,
+        guild_id: int,
+        players: list[Player],
+        selected_id: int | None,
+        page: int = 0,
+        total_pages: int = 1,
+    ):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self.selected_id = selected_id
+        self.page = page
+
+        # Page controls only apply while a player's ledger is open, on its own row so the
+        # three action buttons keep theirs
+        if selected_id is not None and total_pages > 1:
+            self.previous_page.disabled = page == 0
+            self.next_page.disabled = page >= total_pages - 1
+        else:
+            self.remove_item(self.previous_page)
+            self.remove_item(self.next_page)
 
         if players:
             inspect = discord.ui.Select(
@@ -733,18 +811,18 @@ class GMGoldView(discord.ui.View):
             self.overview.label, self.overview.emoji = "Return to Overview", "⬅️"
 
     @classmethod
-    async def create(cls, guild_id: int, selected_id: int | None = None) -> "GMGoldView":
-        return cls(guild_id, await _all_players(guild_id), selected_id)
+    async def create(
+        cls, guild_id: int, selected_id: int | None = None, page: int = 0, total_pages: int = 1
+    ) -> "GMGoldView":
+        return cls(guild_id, await _all_players(guild_id), selected_id, page, total_pages)
 
     async def _inspect(self, interaction: discord.Interaction):
         player = await resolve_player(self.guild_id, interaction.data["values"][0])
         if not player:
             await interaction.response.send_message("⚠️ That player no longer exists.", ephemeral=True)
             return
-        await interaction.response.edit_message(
-            content=await _gm_ledger_message(player),
-            view=await GMGoldView.create(self.guild_id, player.id),
-        )
+        content, view = await gm_ledger_panel(self.guild_id, player)
+        await interaction.response.edit_message(content=content, view=view)
 
     @discord.ui.button(label="Refresh Balances", style=discord.ButtonStyle.primary, emoji="🔄", row=1)
     async def overview(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -763,6 +841,22 @@ class GMGoldView(discord.ui.View):
         await interaction.response.defer()
         text, files = await build_report(self.guild_id)
         await interaction.followup.send(text, files=files, ephemeral=True)
+
+    async def _show_ledger(self, interaction: discord.Interaction, page: int):
+        player = await resolve_player(self.guild_id, str(self.selected_id))
+        if not player:
+            await interaction.response.send_message("⚠️ That player no longer exists.", ephemeral=True)
+            return
+        content, view = await gm_ledger_panel(self.guild_id, player, page)
+        await interaction.response.edit_message(content=content, view=view)
+
+    @discord.ui.button(label="Newer", style=discord.ButtonStyle.secondary, emoji="◀️", row=2)
+    async def previous_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show_ledger(interaction, self.page - 1)
+
+    @discord.ui.button(label="Older", style=discord.ButtonStyle.secondary, emoji="▶️", row=2)
+    async def next_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show_ledger(interaction, self.page + 1)
 
 
 class EconomyCog(commands.Cog):

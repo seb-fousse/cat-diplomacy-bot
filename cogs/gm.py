@@ -7,7 +7,7 @@ from tortoise import Tortoise, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from models import GameState, GoldTransaction, MarketEvent, Player, Order
 from cogs import economy, market
-from formatting import DISCORD_MESSAGE_LIMIT, format_order, truncate
+from formatting import DISCORD_MESSAGE_LIMIT, chunk_blocks, format_order, page_slice
 
 SERVER_TIPS_PATH = os.path.join(os.path.dirname(__file__), "..", "content", "server_tips.md")
 
@@ -259,7 +259,8 @@ class GMCog(commands.Cog):
     @gm.command(name="orders", description="[GM] View all submitted orders for the current turn")
     @commands.has_role("GM")
     async def orders(self, ctx: discord.ApplicationContext):
-        await ctx.respond(content=await orders_overview(ctx.guild.id), view=GMOrdersView(), ephemeral=True)
+        content, view = await orders_panel(ctx.guild.id)
+        await ctx.respond(content=content, view=view, ephemeral=True)
 
     # -------------------------------------------------------------------------
     # /gm gold
@@ -519,12 +520,17 @@ async def turn_panel_message(guild_id: int, notice: str = "") -> str:
     return f"{header}🗓️ **Turn Control**\n\n{body}"
 
 
-async def orders_overview(guild_id: int) -> str:
+# Leaves room for the page indicator appended to each page
+ORDERS_PAGE_LIMIT = DISCORD_MESSAGE_LIMIT - 60
+
+
+async def orders_pages(guild_id: int) -> list[str]:
+    """The current turn's orders, split into pages that each fit one Discord message.
+    Each faction is kept whole wherever it fits, so a page never starts mid-faction."""
     state = await GameState.get_or_none(guild_id=guild_id)
     if not state:
-        return "⚠️ No turn has been set yet. Run `/gm turn` first."
+        return ["⚠️ No turn has been set yet. Run `/gm turn` first."]
 
-    # Query orders for current turn, prefetch players
     orders = await Order.filter(
         player__guild_id=guild_id,
         season=state.season,
@@ -532,48 +538,65 @@ async def orders_overview(guild_id: int) -> str:
         status="submitted"
     ).prefetch_related("player")
 
-    # Get all active players for comparison
     all_players = await Player.filter(guild_id=guild_id, is_eliminated=False)
     submitted_factions = {o.player.faction_name for o in orders}
 
     if not orders and not all_players:
-        return "**No players or orders yet.**"
+        return ["**No players or orders yet.**"]
 
-    lines = [f"**Orders for {state.season} {state.year}:**\n"]
-
-    # Group orders by faction
-    faction_orders = {}
+    faction_orders: dict[str, list[Order]] = {}
     for order in orders:
         faction_orders.setdefault(order.player.faction_name, []).append(order)
 
-    # Display submitted factions
-    for faction in sorted(faction_orders.keys()):
-        lines.append(f"🐱 **{faction}**")
-        for order in faction_orders[faction]:
-            lines.append(format_order(order))
-        lines.append("")
+    blocks = [f"**Orders for {state.season} {state.year}:**"]
+    for faction in sorted(faction_orders):
+        rows = [format_order(order) for order in faction_orders[faction]]
+        blocks.append("\n".join([f"🐱 **{faction}**", *rows]))
 
-    # Display factions with no submissions
-    no_orders_factions = [p.faction_name for p in all_players if p.faction_name not in submitted_factions]
-    if no_orders_factions:
-        lines.append("⚠️ **No orders submitted:**")
-        for faction in sorted(no_orders_factions):
-            lines.append(f"  — {faction}")
+    missing = sorted(p.faction_name for p in all_players if p.faction_name not in submitted_factions)
+    if missing:
+        blocks.append("\n".join(["⚠️ **No orders submitted:**", *(f"  — {f}" for f in missing)]))
 
-    # Interim guard: a long turn overflows Discord's 2000-character message limit, which
-    # would make this panel fail outright. Pagination replaces this.
-    return truncate("\n".join(lines), DISCORD_MESSAGE_LIMIT)
+    return chunk_blocks(blocks, limit=ORDERS_PAGE_LIMIT, separator="\n\n")
+
+
+async def orders_panel(guild_id: int, page: int = 0) -> tuple[str, "GMOrdersView"]:
+    pages = await orders_pages(guild_id)
+    _, page, total_pages = page_slice(pages, page, 1)
+    content = pages[page] + (f"\n\n*Page {page + 1} of {total_pages}*" if total_pages > 1 else "")
+    return content, GMOrdersView(guild_id, page, total_pages)
 
 
 class GMOrdersView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild_id: int, page: int = 0, total_pages: int = 1):
         super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.page = page
+
+        # A turn that fits on one page keeps the panel as it was — just Refresh
+        if total_pages <= 1:
+            self.remove_item(self.previous_page)
+            self.remove_item(self.next_page)
+        else:
+            self.previous_page.disabled = page == 0
+            self.next_page.disabled = page >= total_pages - 1
+
+    async def _show(self, interaction: discord.Interaction, page: int):
+        content, view = await orders_panel(self.guild_id, page)
+        await interaction.response.edit_message(content=content, view=view)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️")
+    async def previous_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show(interaction, self.page - 1)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, emoji="▶️")
+    async def next_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show(interaction, self.page + 1)
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def refresh(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.edit_message(
-            content=await orders_overview(interaction.guild.id), view=GMOrdersView()
-        )
+        # Rebuilt from the database, so the page count follows late submissions
+        await self._show(interaction, self.page)
 
 
 class TurnView(discord.ui.View):
