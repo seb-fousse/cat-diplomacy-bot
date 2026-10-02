@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,8 @@ ATTACHMENT_DIR = Path(__file__).resolve().parent.parent / "data" / "confessional
 ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_DELAY_MINUTES = 180
+
+logger = logging.getLogger(__name__)
 
 
 def _job_id(log_id: int) -> str:
@@ -92,12 +95,12 @@ class ConfessionalCog(commands.Cog):
 
         guild = self.bot.get_guild(log.guild_id)
         if not guild:
-            print(f"[confessional] Guild {log.guild_id} not found for pending log {log_id}")
+            logger.warning(f"Guild {log.guild_id} not found for pending log {log_id}")
             return
 
         confessional_channel = discord.utils.get(guild.text_channels, name="confessional")
         if not confessional_channel:
-            print(f"[confessional] #confessional channel missing in guild {log.guild_id} for log {log_id}")
+            logger.warning(f"#confessional channel missing in guild {log.guild_id} for log {log_id}")
             return
 
         file = None
@@ -105,7 +108,7 @@ class ConfessionalCog(commands.Cog):
             try:
                 file = discord.File(log.attachment_path, filename=log.attachment_filename or "attachment")
             except FileNotFoundError:
-                print(f"[confessional] Missing attachment file for log {log_id}: {log.attachment_path}")
+                logger.warning(f"Missing attachment file for log {log_id}: {log.attachment_path}")
 
         await confessional_channel.send(content=log.message, file=file)
 
@@ -120,23 +123,8 @@ class ConfessionalCog(commands.Cog):
 
     @discord.slash_command(name="confessional", description="Post anonymously to the confessional channel")
     async def confessional(self, ctx: discord.ApplicationContext):
-        player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
-        channel = ctx.channel
-        category = channel.category
-
-        is_in_player_channel = (
-            category
-            and category.name.startswith("🐱 ")
-            and channel.name.endswith("-orders")
-        )
-
-        if not is_in_player_channel and not player.is_eliminated:
-            await ctx.respond(
-                "⚠️ This command can only be used in your private orders channel, or by eliminated players.",
-                ephemeral=True,
-            )
-            return
-
+        # Open to anyone on the server — players, the GM and spectators alike — from any channel.
+        # The post itself carries no author, and the command's reply is ephemeral.
         confessional_channel = discord.utils.get(ctx.guild.text_channels, name="confessional")
         if not confessional_channel:
             await ctx.respond(
@@ -187,7 +175,7 @@ class ConfessionalCog(commands.Cog):
 
         player = await Player.get_or_none(guild_id=interaction.guild.id, user_id=interaction.user.id)
         if not player:
-            print(f"[confessional] No DB record for user {interaction.user.id} — logging without player link")
+            logger.info(f"Confession from non-player {interaction.user.id} — logged without a player link")
 
         if delay_minutes == 0:
             file = None

@@ -1,3 +1,5 @@
+import logging
+
 import discord
 from apscheduler.triggers.cron import CronTrigger
 from dataclasses import dataclass
@@ -6,6 +8,9 @@ from discord.ext import commands
 from models import GameState, Order as OrderRecord, Player
 from discord.ui.input_text import InputText as _InputText
 from discord.ui.label import Label as _Label
+
+log = logging.getLogger(__name__)
+
 
 # Pycord bug: InputText(required=False) stores None instead of False because
 # _generate_underlying does `required = False or self.required` — Python's `or`
@@ -40,7 +45,8 @@ class Order:
 
 
 def _deadline_line(game_state: GameState | None) -> str:
-    """Line describing when submissions close, or the closed/unset state."""
+    """Line describing when the GM intends to close submissions, or the closed/unset state.
+    Closing is a manual GM action, so the schedule is an intention, not a hard cut-off."""
     if game_state is None:
         return "⚠️ *The GM hasn't set the current turn yet.*"
     if game_state.turn_status == "closed":
@@ -58,7 +64,7 @@ def _deadline_line(game_state: GameState | None) -> str:
     if not next_close:
         return ""
     epoch = int(next_close.timestamp())
-    return f"⏰ Orders close <t:{epoch}:R> (<t:{epoch}:F>)."
+    return f"⏰ The GM plans to close orders <t:{epoch}:R> (<t:{epoch}:F>)."
 
 
 def _orders_message(
@@ -149,7 +155,7 @@ class OrdersView(discord.ui.View):
         orders = self.cog.pending_orders.get(self.user_id, [])
         if orders:
             removed = orders.pop()
-            print(f"[orders] Removed order for user {self.user_id}: {removed}")
+            log.info(f"Removed order for user {self.user_id}: {removed}")
         await self.cog.render(interaction, self.user_id)
 
     @discord.ui.button(label="Save Orders", style=discord.ButtonStyle.success, emoji="💾")
@@ -171,12 +177,17 @@ class OrdersView(discord.ui.View):
 
         faction = interaction.channel.category.name.removeprefix("🐱 ")
 
-        print(f"[orders] ── SAVE from {interaction.user} ({faction}) ──")
-        for i, order in enumerate(orders, 1):
-            print(f"  {i:>2}. {order}")
-        print(f"[orders] ── {len(orders)} order(s) total ──")
+        log.info(
+            f"Save from {interaction.user} ({faction}): {len(orders)} order(s)"
+            + "".join(f"\n  {i:>2}. {order}" for i, order in enumerate(orders, 1))
+        )
 
         player = await Player.get_or_none(guild_id=interaction.guild.id, user_id=interaction.user.id)
+        if player and player.is_eliminated:
+            await interaction.response.send_message(
+                "⚠️ You have been eliminated and can no longer submit orders.", ephemeral=True
+            )
+            return
         if player:
             await OrderRecord.filter(
                 player=player, season=game_state.season, year=game_state.year, status="submitted"
@@ -203,7 +214,7 @@ class OrdersView(discord.ui.View):
                 f"🗑️ **Orders withdrawn for {faction}.** You have no orders saved for this turn."
             )
         else:
-            print(f"[orders] No DB record for user {interaction.user.id} — orders not persisted")
+            log.warning(f"No DB record for user {interaction.user.id} — orders not persisted")
             notice = "⚠️ You're not registered as a player — orders were not saved. Ask the GM."
 
         await self.cog.render(interaction, self.user_id, notice)
@@ -251,6 +262,13 @@ class OrdersCog(commands.Cog):
             await ctx.respond("⚠️ Only active players can submit orders.", ephemeral=True)
             return
 
+        player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
+        if player and player.is_eliminated:
+            await ctx.respond(
+                "⚠️ You have been eliminated and can no longer submit orders.", ephemeral=True
+            )
+            return
+
         channel = ctx.channel
         category = channel.category
 
@@ -268,7 +286,6 @@ class OrdersCog(commands.Cog):
         saved: list[Order] = []
         game_state = await GameState.get_or_none(guild_id=ctx.guild.id)
         if game_state:
-            player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
             if player:
                 db_orders = await OrderRecord.filter(
                     player=player,

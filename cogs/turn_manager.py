@@ -1,3 +1,5 @@
+import logging
+
 import discord
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -7,6 +9,9 @@ from discord.ext import commands
 from tortoise import timezone
 from models import GameState, Player, Order
 from cogs import economy
+from formatting import chunk_blocks, format_order
+
+log = logging.getLogger(__name__)
 
 
 # When close hour is 0, the reminder fires at 23:xx the previous day
@@ -17,6 +22,26 @@ WEEKDAY_PREVIOUS = {
 
 OVERDUE_THRESHOLD = timedelta(hours=12)
 OVERDUE_CHECK_INTERVAL_MINUTES = 30
+
+
+def _public_orders_messages(state: GameState, orders: list[Order]) -> list[str]:
+    """The turn's orders as one or more messages. Each faction's block is kept whole where
+    it fits, since Discord refuses any single message over 2000 characters and a long turn
+    would otherwise drop the whole public record."""
+    rule = "═══════════════════════════════════"
+    header = f"{rule}\n**{state.season} {state.year} — Orders**\n{rule}"
+    if not orders:
+        return [f"{header}\n\n*No orders submitted this turn.*"]
+
+    faction_orders: dict[str, list[Order]] = {}
+    for o in orders:
+        faction_orders.setdefault(o.player.faction_name, []).append(o)
+
+    blocks = [header]
+    for faction in sorted(faction_orders):
+        rows = [f"  {i}. {format_order(o)}" for i, o in enumerate(faction_orders[faction], 1)]
+        blocks.append("\n".join([f"🐱 **{faction}**", *rows]))
+    return chunk_blocks(blocks, separator="\n\n")
 
 
 class TurnManagerCog(commands.Cog):
@@ -131,7 +156,7 @@ class TurnManagerCog(commands.Cog):
                     f"Use `/gm turn` → **Close Submissions**."
                 )
             except Exception as e:
-                print(f"[turn_manager] Failed to post close reminder: {e}")
+                log.exception("Failed to post close reminder")
 
     async def close_submissions(self, guild: discord.Guild, state: GameState) -> str:
         """Manually close order submissions for the current turn. Called from the GM
@@ -141,7 +166,7 @@ class TurnManagerCog(commands.Cog):
         try:
             await economy.snapshot_balances(guild_id, state.season, state.year)
         except Exception as e:
-            print(f"[turn_manager] Failed to snapshot balances: {e}")
+            log.exception("Failed to snapshot balances")
 
         no_order_players, orders = await self._missing_orders(guild_id, state)
 
@@ -154,7 +179,7 @@ class TurnManagerCog(commands.Cog):
                     f"You did not submit any orders this turn."
                 )
             except Exception as e:
-                print(f"[turn_manager] Failed to DM user {player.user_id}: {e}")
+                log.warning(f"Failed to DM user {player.user_id}: {e}")
 
         # Post to #game-log
         game_log = discord.utils.get(guild.text_channels, name="game-log")
@@ -162,37 +187,16 @@ class TurnManagerCog(commands.Cog):
             try:
                 await game_log.send(f"🔒 Orders closed for **{state.season} {state.year}**.")
             except Exception as e:
-                print(f"[turn_manager] Failed to post to game-log: {e}")
+                log.exception("Failed to post to game-log")
 
         # Post all submitted orders to #public-orders, grouped by faction
         public_orders = discord.utils.get(guild.text_channels, name="public-orders")
         if public_orders:
             try:
-                lines = [f"═══════════════════════════════════"]
-                lines.append(f"**{state.season} {state.year} — Orders**")
-                lines.append(f"═══════════════════════════════════\n")
-
-                if not orders:
-                    lines.append("*No orders submitted this turn.*")
-                else:
-                    faction_orders = {}
-                    for o in orders:
-                        faction_orders.setdefault(o.player.faction_name, []).append(o)
-
-                    for faction in sorted(faction_orders.keys()):
-                        lines.append(f"🐱 **{faction}**")
-                        for i, o in enumerate(faction_orders[faction], 1):
-                            if o.order_type == "HOLD":
-                                lines.append(f"  {i}. {o.unit} — HOLDS")
-                            elif o.order_type == "MOVE":
-                                lines.append(f"  {i}. {o.unit} — MOVE to {o.target}")
-                            else:
-                                lines.append(f"  {i}. {o.unit} — {o.order_type} {o.target or ''}")
-                        lines.append("")
-
-                await public_orders.send("\n".join(lines))
-            except Exception as e:
-                print(f"[turn_manager] Failed to post to public-orders: {e}")
+                for message in _public_orders_messages(state, orders):
+                    await public_orders.send(message)
+            except Exception:
+                log.exception("Failed to post to public-orders")
 
         state.turn_status = "closed"
         state.closed_at = timezone.now()
@@ -229,14 +233,16 @@ class TurnManagerCog(commands.Cog):
                         f"closed for **{hours}+ hours**. Don't forget to hit **Next Turn** in `/gm turn`!"
                     )
                 except Exception as e:
-                    print(f"[turn_manager] Failed to post overdue reminder: {e}")
+                    log.exception("Failed to post overdue reminder")
 
             state.next_turn_reminder_sent_at = now
             await state.save()
 
     async def _reminder_job(self, guild_id):
         state = await GameState.get_or_none(guild_id=guild_id)
-        if not state:
+        # Nothing to warn players about once the turn is closed — telling them to submit
+        # when /orders already refuses them is worse than saying nothing
+        if not state or state.turn_status != "open":
             return
 
         guild = self.bot.get_guild(guild_id)
@@ -248,11 +254,12 @@ class TurnManagerCog(commands.Cog):
             try:
                 time_str = f"{state.close_hour:02d}:{state.close_minute:02d}"
                 await town_square.send(
-                    f"@everyone ⏰ Orders close in **1 hour** at **{time_str} {state.close_timezone}** for "
-                    f"**{state.season} {state.year}**. Submit your orders now!"
+                    f"@everyone ⏰ The Cat Diplomat plans to close orders for "
+                    f"**{state.season} {state.year}** in about **1 hour**, at "
+                    f"**{time_str} {state.close_timezone}**. Get your orders in!"
                 )
             except Exception as e:
-                print(f"[turn_manager] Failed to post reminder: {e}")
+                log.exception("Failed to post reminder")
 
 
 def setup(bot):

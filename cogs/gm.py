@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import discord
 from discord.ext import commands
@@ -6,8 +7,14 @@ from tortoise import Tortoise, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from models import GameState, GoldTransaction, MarketEvent, Player, Order
 from cogs import economy, market
+from formatting import DISCORD_MESSAGE_LIMIT, format_order, truncate
 
 SERVER_TIPS_PATH = os.path.join(os.path.dirname(__file__), "..", "content", "server_tips.md")
+
+log = logging.getLogger(__name__)
+setup_log = log.getChild("setup")
+teardown_log = log.getChild("teardown")
+turn_log = log.getChild("turn")
 
 
 class GMCog(commands.Cog):
@@ -59,27 +66,27 @@ class GMCog(commands.Cog):
             )
 
         try:
-            print("[setup] Ensuring database schema...")
+            setup_log.info("Ensuring database schema...")
             await Tortoise.generate_schemas()
 
-            print("[setup] Creating roles...")
+            setup_log.info("Creating roles...")
             roles = await self._create_roles(guild)
             await author.add_roles(roles["GM"])
 
-            print("[setup] Creating public channels...")
+            setup_log.info("Creating public channels...")
             await self._create_public_channels(guild, roles)
 
-            print("[setup] Creating GM channels...")
+            setup_log.info("Creating GM channels...")
             await self._create_gm_channels(guild, roles)
 
-            print("[setup] Done.")
+            setup_log.info("Done.")
             return (
                 "✅ Server initialized! Roles and channels created. "
                 "You've been assigned the **GM** role.\n"
                 "Use **Add Player** to onboard each player."
             )
         except Exception as e:
-            print(f"[setup] ERROR: {e}")
+            setup_log.exception("Setup failed")
             return f"❌ Setup failed: `{e}`"
 
     # -------------------------------------------------------------------------
@@ -157,23 +164,67 @@ class GMCog(commands.Cog):
             except discord.NotFound:
                 user = None
 
+        failed = []
+
         if user is not None:
+            # Only the Player role comes off. The faction role stays, so the player keeps
+            # their colour and their channels stay visible — those are made read-only below.
+            # Every other role they hold is none of our business.
             player_role = discord.utils.get(guild.roles, name="Player")
             eliminated_role = discord.utils.get(guild.roles, name="Eliminated")
-
-            faction_roles = [r for r in user.roles if r not in (player_role, eliminated_role, guild.default_role)]
-
-            roles_to_remove = [r for r in [player_role, *faction_roles] if r in user.roles]
-            await user.remove_roles(*roles_to_remove)
-            await user.add_roles(eliminated_role)
+            try:
+                if player_role and player_role in user.roles:
+                    await user.remove_roles(player_role, reason="Player eliminated")
+                if eliminated_role and eliminated_role not in user.roles:
+                    await user.add_roles(eliminated_role, reason="Player eliminated")
+            except discord.HTTPException as e:
+                log.warning(f"Could not update roles for {player.faction_name}: {e}")
+                failed.append(f"role update for {user.mention} ({e})")
         else:
-            print(f"[eliminate_player] User {player.user_id} has left the server — skipping role update")
+            log.warning(f"User {player.user_id} has left the server — skipping role update")
+
+        failed += await self._lock_faction_channels(guild, player)
 
         player.is_eliminated = True
         await player.save()
+        log.info(f"Eliminated {player.faction_name} (player {player.id})")
 
         who = user.mention if user else f"**{player.faction_name}**"
+        if failed:
+            lines = "\n".join(f"— {f}" for f in failed)
+            return f"⚠️ {who} marked as **Eliminated**, but some Discord changes failed:\n{lines}"
         return f"✅ {who} marked as **Eliminated**. Their channels are now read-only."
+
+    async def _lock_faction_channels(self, guild: discord.Guild, player: Player) -> list[str]:
+        """Leave the faction's channels visible but silent. The overwrite is applied to the
+        category and to each channel in it, because a channel created inside a category gets
+        its own copy of the category's overwrites rather than following later edits to it."""
+        faction_role = discord.utils.get(guild.roles, name=player.faction_name)
+        if not faction_role:
+            log.warning(f"No role named {player.faction_name!r} — channels left writable")
+            return [f"faction role @{player.faction_name} not found — channels are still writable"]
+
+        category = discord.utils.get(guild.categories, name=f"🐱 {player.faction_name}")
+        if not category:
+            log.warning(f"No category named '🐱 {player.faction_name}' — nothing to lock")
+            return [f"category 🐱 {player.faction_name} not found — channels are still writable"]
+
+        # Threads are a second way to write, so they close with the channel
+        read_only = discord.PermissionOverwrite(
+            read_messages=True,
+            send_messages=False,
+            send_messages_in_threads=False,
+            create_public_threads=False,
+            create_private_threads=False,
+        )
+        failed = []
+        for target in (category, *category.channels):
+            try:
+                await target.set_permissions(faction_role, overwrite=read_only, reason="Player eliminated")
+            except discord.HTTPException as e:
+                log.warning(f"Could not lock {target.name}: {e}")
+                failed.append(f"{target.name} could not be made read-only ({e})")
+        return failed
 
     # -------------------------------------------------------------------------
     # /gm speak
@@ -252,29 +303,29 @@ class GMCog(commands.Cog):
                 if not any(category.name.startswith(p) for p in self.MANAGED_CATEGORY_PREFIXES):
                     continue
 
-                print(f"[teardown] Processing category: {category.name}")
+                teardown_log.info(f"Processing category: {category.name}")
 
                 if category.name == "🎩 GM HQ":
                     try:
                         for channel in list(category.channels):
-                            print(f"[teardown] Deleting #{channel.name}")
+                            teardown_log.info(f"Deleting #{channel.name}")
                             await channel.delete()
-                        print(f"[teardown] Deleting category 🎩 GM HQ")
+                        teardown_log.info("Deleting category 🎩 GM HQ")
                         await category.delete()
-                        print(f"[teardown] GM HQ deleted.")
+                        teardown_log.info("GM HQ deleted.")
                     except discord.Forbidden:
                         failed.append("category 🎩 GM HQ (no permission)")
                     continue
 
                 for channel in list(category.channels):
                     try:
-                        print(f"[teardown] Deleting #{channel.name}")
+                        teardown_log.info(f"Deleting #{channel.name}")
                         await channel.delete()
                     except discord.Forbidden:
                         failed.append(f"channel #{channel.name} (no permission)")
 
                 try:
-                    print(f"[teardown] Deleting category: {category.name}")
+                    teardown_log.info(f"Deleting category: {category.name}")
                     await category.delete()
                 except discord.Forbidden:
                     failed.append(f"category {category.name} (no permission)")
@@ -282,12 +333,12 @@ class GMCog(commands.Cog):
             # Delete roles by name — re-fetch to get current state. Faction roles are looked up
             # from the DB now, before the wipe below removes the Player rows that name them.
             faction_names = {p.faction_name for p in await Player.filter(guild_id=guild.id)}
-            print("[teardown] Fetching roles...")
+            teardown_log.info("Fetching roles...")
             all_roles = await guild.fetch_roles()
             for role in all_roles:
                 if not role.is_default() and (role.name in self.MANAGED_ROLE_NAMES or role.name in faction_names):
                     try:
-                        print(f"[teardown] Deleting role @{role.name}")
+                        teardown_log.info(f"Deleting role @{role.name}")
                         await role.delete()
                     except discord.Forbidden:
                         failed.append(f"role @{role.name} (hierarchy — move bot role above it in Server Settings → Roles)")
@@ -295,15 +346,15 @@ class GMCog(commands.Cog):
                         failed.append(f"role @{role.name} ({e})")
 
             # Wipe DB records for this guild — Player deletion cascades to Order, ConfessionalLog and MarketPosition
-            print("[teardown] Wiping database records...")
+            teardown_log.info("Wiping database records...")
             await GameState.filter(guild_id=guild.id).delete()
             await GoldTransaction.filter(guild_id=guild.id).delete()
             await MarketEvent.filter(guild_id=guild.id).delete()
             await Player.filter(guild_id=guild.id).delete()
 
-            print("[teardown] Done.")
+            teardown_log.info("Done.")
         except Exception as e:
-            print(f"[teardown] ERROR: {e}")
+            teardown_log.exception("Teardown failed")
             return f"❌ Teardown failed unexpectedly: `{e}`"
 
         if failed:
@@ -375,7 +426,7 @@ class GMCog(commands.Cog):
             with open(SERVER_TIPS_PATH, encoding="utf-8") as f:
                 content = f.read().strip()
         except OSError as e:
-            print(f"[setup] Could not read server tips file: {e}")
+            setup_log.warning(f"Could not read server tips file: {e}")
             return
         await channel.send(content)
 
@@ -396,8 +447,16 @@ class GMCog(commands.Cog):
 # ---------------------------------------------------------------------------
 
 SEASONS = ["Spring", "Fall", "Winter"]
-VALID_CLOSE_DAYS = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
+CLOSE_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")  # week order, for storage and display
+VALID_CLOSE_DAYS = set(CLOSE_DAYS)
 OVERDUE_HOURS = 12  # matches TurnManagerCog.OVERDUE_THRESHOLD
+
+
+def _ordered_days(weekdays: str) -> list[str]:
+    """Day abbreviations in week order. Anything unrecognised sorts to the end rather than
+    being dropped, so a hand-edited value is still visible to the GM."""
+    days = {d.strip().upper() for d in weekdays.split(",") if d.strip()}
+    return sorted(days, key=lambda d: CLOSE_DAYS.index(d) if d in VALID_CLOSE_DAYS else len(CLOSE_DAYS))
 
 
 def _next_season_year(season: str, year: int) -> tuple[str, int]:
@@ -418,7 +477,7 @@ async def _rename_current_map_channel(guild: discord.Guild, season: str, year: i
             try:
                 await channel.edit(name=channel_name)
             except Exception as e:
-                print(f"[turn] Could not rename channel {channel.name} -> {channel_name}: {e}")
+                turn_log.warning(f"Could not rename channel {channel.name} -> {channel_name}: {e}")
             break
 
 
@@ -432,7 +491,7 @@ async def _post_turn_started(guild: discord.Guild, season: str, year: int):
         try:
             await game_log.send(f"🗓️ **{season} {year}** has begun. Orders are now open.")
         except Exception as e:
-            print(f"[turn] Failed to post turn-start to game-log: {e}")
+            turn_log.exception("Failed to post turn-start to game-log")
 
 
 async def turn_panel_message(guild_id: int, notice: str = "") -> str:
@@ -450,7 +509,7 @@ async def turn_panel_message(guild_id: int, notice: str = "") -> str:
         else:
             body += "**Status:** 🟢 Open for submissions\n"
         if state.close_weekdays and state.close_hour is not None:
-            day_names = ", ".join(state.close_weekdays.split(","))
+            day_names = ", ".join(_ordered_days(state.close_weekdays))
             body += (
                 f"**Close reminder:** every {day_names} at "
                 f"{state.close_hour:02d}:{state.close_minute:02d} {state.close_timezone}"
@@ -491,12 +550,7 @@ async def orders_overview(guild_id: int) -> str:
     for faction in sorted(faction_orders.keys()):
         lines.append(f"🐱 **{faction}**")
         for order in faction_orders[faction]:
-            if order.order_type == "HOLD":
-                lines.append(f"{order.unit} — HOLDS")
-            elif order.order_type == "MOVE":
-                lines.append(f"{order.unit} — MOVE to {order.target}")
-            else:
-                lines.append(f"{order.unit} — {order.order_type} {order.target or ''}")
+            lines.append(format_order(order))
         lines.append("")
 
     # Display factions with no submissions
@@ -506,7 +560,9 @@ async def orders_overview(guild_id: int) -> str:
         for faction in sorted(no_orders_factions):
             lines.append(f"  — {faction}")
 
-    return "\n".join(lines)
+    # Interim guard: a long turn overflows Discord's 2000-character message limit, which
+    # would make this panel fail outright. Pagination replaces this.
+    return truncate("\n".join(lines), DISCORD_MESSAGE_LIMIT)
 
 
 class GMOrdersView(discord.ui.View):
@@ -686,7 +742,12 @@ class SetCloseScheduleModal(discord.ui.DesignerModal):
         self.add_item(self.timezone_label)
 
     async def callback(self, interaction: discord.Interaction):
-        day_list = [d.strip().upper() for d in self.days_label.item.value.split(",")]
+        day_list = [d.strip().upper() for d in self.days_label.item.value.split(",") if d.strip()]
+        if not day_list:
+            await interaction.response.send_message(
+                "❌ Enter at least one day, e.g. `MON,WED,FRI`.", ephemeral=True
+            )
+            return
         invalid = [d for d in day_list if d not in VALID_CLOSE_DAYS]
         if invalid:
             await interaction.response.send_message(
@@ -709,7 +770,7 @@ class SetCloseScheduleModal(discord.ui.DesignerModal):
         raw_timezone = self.timezone_label.item.value.strip()
         try:
             ZoneInfo(raw_timezone)
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             await interaction.response.send_message(
                 f"❌ Unknown timezone `{raw_timezone}`. Use an IANA name like `America/New_York`, "
                 f"`Europe/London`, or `UTC`.",
@@ -718,7 +779,7 @@ class SetCloseScheduleModal(discord.ui.DesignerModal):
             return
 
         state = await GameState.get(guild_id=self.guild_id)
-        state.close_weekdays = ",".join(sorted(set(day_list)))
+        state.close_weekdays = ",".join(_ordered_days(",".join(day_list)))
         state.close_hour = hour
         state.close_minute = minute
         state.close_timezone = raw_timezone
@@ -729,7 +790,7 @@ class SetCloseScheduleModal(discord.ui.DesignerModal):
         if turn_manager:
             await turn_manager.reschedule_for_guild(self.guild_id)
 
-        day_names = ", ".join(state.close_weekdays.split(","))
+        day_names = ", ".join(_ordered_days(state.close_weekdays))
         time_str = f"{hour:02d}:{minute:02d}"
         await interaction.response.edit_message(
             content=await turn_panel_message(
@@ -755,7 +816,7 @@ async def _show_panel(interaction: discord.Interaction, cog: GMCog, notice: str,
         await interaction.edit_original_response(content=content, view=view)
     except discord.HTTPException as e:
         # e.g. teardown deleted the channel the panel lived in
-        print(f"[manage] Could not update panel: {e}")
+        log.warning(f"Could not update panel: {e}")
 
 
 class AddPlayerModal(discord.ui.DesignerModal):

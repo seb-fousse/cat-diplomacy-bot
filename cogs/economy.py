@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 from collections import defaultdict
 
 import discord
@@ -10,6 +11,9 @@ from tortoise.transactions import in_transaction
 
 from models import BalanceSnapshot, GameState, GoldTransaction, MarketEvent, MarketPosition, Player
 import cogs.orders  # noqa: F401 — applies the pycord patch that makes optional modal inputs work
+from formatting import truncate
+
+log = logging.getLogger(__name__)
 
 SEASON_ORDER = {"Spring": 0, "Fall": 1, "Winter": 2}
 HISTORY_LIMIT = 15
@@ -115,6 +119,12 @@ async def stake(player: Player, event_id: int, side: str, amount: int, initiated
 
     season, year = await _current_turn(player.guild_id)
     async with in_transaction() as conn:
+        # Checked here as well as in the UI so a stale panel can never place a bet
+        # after the GM has turned markets off
+        state = await GameState.get_or_none(guild_id=player.guild_id, using_db=conn)
+        if not state or not state.markets_enabled:
+            raise EconomyError("Markets are closed right now.")
+
         event = await MarketEvent.get_or_none(id=event_id, guild_id=player.guild_id, using_db=conn)
         if not event or event.status != "OPEN":
             raise EconomyError("Betting on this market is closed.")
@@ -291,10 +301,6 @@ def _note(tx: GoldTransaction) -> str:
     return f' — "{text}"'
 
 
-def _truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
 def code_table(headers: list[str], rows: list[list[str]], left: set[int]) -> str:
     """Monospace table in a code block; columns in `left` are left-aligned, the rest right-aligned."""
     widths = [max(len(r[i]) for r in [headers, *rows]) for i in range(len(headers))]
@@ -321,7 +327,7 @@ def _describe(tx: GoldTransaction, viewer: Player, gm: bool) -> str:
         else:
             text = "From the Cat Diplomat" if granting else "Taken by the Cat Diplomat"
         text += f" — {tx.reason}" if tx.reason else ""
-    return _truncate(text, 40)
+    return truncate(text, 40)
 
 
 def transactions_table(txs: list[GoldTransaction], viewer: Player, gm: bool = False) -> str:
@@ -542,7 +548,7 @@ class SendGoldModal(discord.ui.DesignerModal):
             await interaction.response.send_message(f"❌ {e} You have **{sender.gold_balance} gold**.", ephemeral=True)
             return
 
-        print(f"[economy] {sender.faction_name} → {recipient.faction_name}: {amount} (tx {tx.id})")
+        log.info(f"{sender.faction_name} → {recipient.faction_name}: {amount} (tx {tx.id})")
         await _notify_recipient(interaction.client, recipient, sender, tx)
 
         await sender.refresh_from_db()
@@ -568,7 +574,8 @@ class GoldView(discord.ui.View):
     def __init__(self, player: Player, history: bool = False):
         super().__init__(timeout=None)
         self.player_id = player.id
-        self.send_gold.disabled = player.is_eliminated
+        # Nothing to send with an empty treasury, so don't offer the button at all
+        self.send_gold.disabled = player.is_eliminated or player.gold_balance <= 0
         self.transactions.disabled = history
         if history:
             self.balance.label, self.balance.emoji = "View Balance", "💰"
@@ -630,7 +637,7 @@ async def gm_overview_message(guild_id: int, notice: str = "") -> str:
     else:
         locked = await locked_gold(guild_id)
         rows = [
-            [_truncate(p.faction_name, 24), _truncate(p.player_name or "unknown", 16),
+            [truncate(p.faction_name, 24), truncate(p.player_name or "unknown", 16),
              str(p.gold_balance), str(locked[p.id]) if locked[p.id] else "", "out" if p.is_eliminated else ""]
             for p in players
         ]
@@ -696,7 +703,7 @@ class AdjustGoldModal(discord.ui.DesignerModal):
             )
             return
 
-        print(f"[economy] GM adjust {player.faction_name}: {amount:+} (tx {tx.id}) — {reason}")
+        log.info(f"GM adjust {player.faction_name}: {amount:+} (tx {tx.id}) — {reason}")
         await player.refresh_from_db()
         await interaction.response.edit_message(
             content=await _gm_ledger_message(

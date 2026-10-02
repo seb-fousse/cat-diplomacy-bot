@@ -1,5 +1,5 @@
 import asyncio
-import traceback
+import logging
 from collections import defaultdict
 
 import discord
@@ -8,6 +8,9 @@ from discord.ext import commands
 from models import GameState, GoldTransaction, MarketEvent, MarketPosition, Player
 from cogs import economy
 from cogs.economy import MARKET_SIDES, EconomyError, code_table
+from formatting import truncate
+
+log = logging.getLogger(__name__)
 
 SIDE_EMOJI = {"YES": "🟢", "NO": "🔴"}
 STATUS_EMOJI = {"OPEN": "📈", "CLOSED": "🔒", "RESOLVED": "🏁", "CANCELLED": "🚫"}
@@ -62,7 +65,9 @@ def _jump_url(event: MarketEvent) -> str:
     return f"https://discord.com/channels/{event.guild_id}/{event.channel_id}/{event.message_id}"
 
 
-def _status_line(event: MarketEvent, total: int) -> str:
+def _status_line(event: MarketEvent, total: int, betting_enabled: bool = True) -> str:
+    if event.status == "OPEN" and not betting_enabled:
+        return "🚫 *The Cat Diplomat isn't taking bets right now.*"
     if event.status == "OPEN":
         return "*Place your bets below. Bets are anonymous and your gold stays locked until the market is resolved.*"
     if event.status == "CLOSED":
@@ -77,7 +82,7 @@ def _status_line(event: MarketEvent, total: int) -> str:
     return f"🚫 **Cancelled** — {event.cancel_reason}\nEvery stake has been returned."
 
 
-async def public_post_content(event: MarketEvent) -> str:
+async def public_post_content(event: MarketEvent, betting_enabled: bool = True) -> str:
     lines = [f"🎩 **The Cat Diplomat opens a market** · #{event.id}", f"## {event.question}"]
     if event.description:
         lines.append("\n".join(f"> {line}" for line in event.description.splitlines()))
@@ -85,7 +90,7 @@ async def public_post_content(event: MarketEvent) -> str:
     pools = await _pools(event.id)
     lines.extend(_pool_lines(pools))
     lines.append("")
-    lines.append(_status_line(event, sum(pools.values())))
+    lines.append(_status_line(event, sum(pools.values()), betting_enabled))
     return "\n".join(lines)
 
 
@@ -96,21 +101,32 @@ async def refresh_post(bot: discord.Bot, event_id: int):
             return
         channel = bot.get_channel(event.channel_id)
         if not channel:
-            print(f"[market] Channel {event.channel_id} missing for market {event_id}")
+            log.warning(f"Channel {event.channel_id} missing for market {event_id}")
             return
         settled = event.status in ("RESOLVED", "CANCELLED")
+        betting_enabled = await _markets_enabled(event.guild_id)
         message = channel.get_partial_message(event.message_id)
         try:
             await message.edit(
-                content=await public_post_content(event), view=None if settled else MarketView(event.id, event.status)
+                content=await public_post_content(event, betting_enabled),
+                view=None if settled else MarketView(event.id, event.status, betting_enabled),
             )
         except discord.HTTPException as e:
-            print(f"[market] Could not update post for market {event_id}: {e}")
+            log.warning(f"Could not update post for market {event_id}: {e}")
         if settled:
             try:
                 await message.unpin(reason=f"Market #{event.id} settled")
             except discord.HTTPException as e:
-                print(f"[market] Could not unpin market {event_id}: {e}")
+                log.warning(f"Could not unpin market {event_id}: {e}")
+
+
+async def refresh_open_posts(bot: discord.Bot, guild_id: int) -> int:
+    """Re-render every post that still has live buttons so they follow the markets toggle.
+    Only OPEN markets need it — closed and settled posts already render disabled."""
+    events = await MarketEvent.filter(guild_id=guild_id, status="OPEN", message_id__isnull=False)
+    for event in events:
+        await refresh_post(bot, event.id)
+    return len(events)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +184,7 @@ async def notify_bettors(bot: discord.Bot, event: MarketEvent):
             else:
                 await (await bot.fetch_user(player.user_id)).send(text)
         except discord.HTTPException as e:
-            print(f"[market] Could not notify {player.faction_name} about market {event.id}: {e}")
+            log.warning(f"Could not notify {player.faction_name} about market {event.id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +199,8 @@ async def _bet_gate(interaction: discord.Interaction, event_id: int) -> tuple[Pl
         reason = "⚠️ Only players can place bets."
     elif player.is_eliminated:
         reason = "⚠️ Eliminated players can't place bets."
+    elif not await _markets_enabled(interaction.guild.id):
+        reason = "🚫 Markets are closed — the Cat Diplomat isn't taking bets right now."
     elif not event or event.status != "OPEN":
         reason = "🔒 Betting on this market is closed."
     elif player.gold_balance <= 0:
@@ -227,15 +245,14 @@ class BetModal(discord.ui.DesignerModal):
             await interaction.response.send_message(msg, ephemeral=True)
             return
         except Exception:
-            print(f"[market] Unexpected error placing bet for {player.faction_name} (market {self.event_id}):")
-            traceback.print_exc()
+            log.exception(f"Unexpected error placing bet for {player.faction_name} (market {self.event_id})")
             await interaction.response.send_message(
                 "❌ Something went wrong placing that bet and your gold wasn't touched. Please try again.",
                 ephemeral=True,
             )
             return
 
-        print(f"[market] {player.faction_name} bet {amount} on {self.side} (market {self.event_id})")
+        log.info(f"{player.faction_name} bet {amount} on {self.side} (market {self.event_id})")
         await player.refresh_from_db()
         notice = (
             f"✅ Bet **{amount} gold** on {SIDE_EMOJI[self.side]} **{self.side}**. "
@@ -255,10 +272,10 @@ class BetModal(discord.ui.DesignerModal):
 class MarketView(discord.ui.View):
     """Persistent view — custom_ids are derived from the market id so buttons survive restarts."""
 
-    def __init__(self, event_id: int, status: str):
+    def __init__(self, event_id: int, status: str, betting_enabled: bool = True):
         super().__init__(timeout=None)
         self.event_id = event_id
-        betting_open = status == "OPEN"
+        betting_open = status == "OPEN" and betting_enabled
 
         for side, style in (("YES", discord.ButtonStyle.success), ("NO", discord.ButtonStyle.danger)):
             button = discord.ui.Button(
@@ -321,6 +338,11 @@ async def markets_panel_message(player: Player, selected_id: int | None = None, 
         my_positions[pos.event_id].append(pos)
     locked = sum(p.amount for positions in my_positions.values() for p in positions)
 
+    # Betting is over on a CLOSED market and the dropdown won't offer it, so it is only
+    # worth a line while it still holds this player's gold. Counted into `locked` above
+    # first, so the header total stays right either way.
+    events = [e for e in events if e.status == "OPEN" or my_positions.get(e.id)]
+
     lines = [
         f"{header}🎲 **Markets** — you hold **{player.gold_balance} gold**"
         + (f" · **{locked} gold** locked in markets" if locked else "")
@@ -345,7 +367,7 @@ async def markets_panel_message(player: Player, selected_id: int | None = None, 
         lines.append("\n\u26a0\ufe0f **You are eliminated and cannot place new bets.**")
 
     # Discord trims trailing blank lines; a zero-width space keeps a gap above the dropdown
-    return _truncate("\n".join(lines), 1990) + "\n\u200b"
+    return truncate("\n".join(lines), 1990) + "\n\u200b"
 
 
 class MarketsPanelView(discord.ui.View):
@@ -359,7 +381,7 @@ class MarketsPanelView(discord.ui.View):
                 placeholder="Pick a market to bet on...",
                 options=[
                     discord.SelectOption(
-                        label=_truncate(f"#{e.id} {e.question}", 100), value=str(e.id),
+                        label=truncate(f"#{e.id} {e.question}", 100), value=str(e.id),
                         emoji=STATUS_EMOJI[e.status], default=e.id == self.selected_id,
                     )
                     for e in open_events[:25]
@@ -418,10 +440,6 @@ async def _markets_enabled(guild_id: int) -> bool:
     return bool(state and state.markets_enabled)
 
 
-def _truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
 async def gm_list_message(guild_id: int, notice: str = "") -> str:
     header = f"{notice}\n\n" if notice else ""
     events = await _recent_events(guild_id)
@@ -434,11 +452,11 @@ async def gm_list_message(guild_id: int, notice: str = "") -> str:
             pools = await _pools(e.id)
             total = sum(pools.values())
             odds = [f"{pools[side] * 100 / total:.0f}%" if total else "—" for side in MARKET_SIDES]
-            rows.append([STATUS_EMOJI[e.status], e.status, f"#{e.id}", _truncate(e.question, 28), str(total), *odds])
+            rows.append([STATUS_EMOJI[e.status], e.status, f"#{e.id}", truncate(e.question, 28), str(total), *odds])
         # Every row, header included, starts with exactly one emoji, so emoji width shifts all rows equally
         table = code_table(["🎲", "Status", "#", "Market", "Gold", "YES", "NO"], rows, left={0, 1, 3})
         body = f"{status}\n\n" + table + "\n*Pick a market below to see its breakdown and manage it.*"
-    return _truncate(f"{header}🎲 **Market Office**\n\n{body}", 2000)
+    return truncate(f"{header}🎲 **Market Office**\n\n{body}", 2000)
 
 
 def _positions_table(event: MarketEvent, positions: list[MarketPosition], pools: dict[str, int]) -> str:
@@ -453,7 +471,7 @@ def _positions_table(event: MarketEvent, positions: list[MarketPosition], pools:
     for faction in sorted(stakes):
         yes, no = stakes[faction].get("YES"), stakes[faction].get("NO")
         staked = (yes.amount if yes else 0) + (no.amount if no else 0)
-        row = [_truncate(faction, 16), str(yes.amount if yes else "—"), str(no.amount if no else "—")]
+        row = [truncate(faction, 16), str(yes.amount if yes else "—"), str(no.amount if no else "—")]
         if settled:
             paid = sum(p.payout or 0 for p in (yes, no) if p)
             row += [str(paid), f"{paid - staked:+}"]
@@ -479,7 +497,7 @@ async def gm_detail_message(event: MarketEvent, notice: str = "") -> str:
         f"## {event.question}",
     ]
     if event.description:
-        lines.append(_truncate("\n".join(f"> {line}" for line in event.description.splitlines()), 600))
+        lines.append(truncate("\n".join(f"> {line}" for line in event.description.splitlines()), 600))
 
     timeline = [f"Opened {discord.utils.format_dt(event.created_at, 'f')}"]
     if event.closed_at:
@@ -502,6 +520,9 @@ async def gm_detail_message(event: MarketEvent, notice: str = "") -> str:
     if event.status in ("RESOLVED", "CANCELLED"):
         lines.append("")
         lines.append(_status_line(event, total))
+    elif event.status == "OPEN" and not await _markets_enabled(event.guild_id):
+        lines.append("")
+        lines.append("🚫 *Markets are disabled, so the bet buttons on this post are greyed out.*")
 
     lines.append("\n**Positions** *(GM eyes only)*")
     if positions:
@@ -510,7 +531,7 @@ async def gm_detail_message(event: MarketEvent, notice: str = "") -> str:
             lines.append("*\"If YES\" / \"If NO\" are payouts at the current pool sizes.*")
     else:
         lines.append("*No bets yet.*")
-    return _truncate("\n".join(lines), 2000)
+    return truncate("\n".join(lines), 2000)
 
 
 async def gm_panel_message(guild_id: int, selected_id: int | None = None, notice: str = "") -> str:
@@ -557,12 +578,16 @@ class NewMarketModal(discord.ui.DesignerModal):
             return
 
         await interaction.response.defer()
+        betting_enabled = await _markets_enabled(self.guild_id)
         event = await MarketEvent.create(
             guild_id=self.guild_id, question=question, description=description,
             channel_id=town_square.id, created_by=interaction.user.id,
         )
         try:
-            message = await town_square.send(content=await public_post_content(event), view=MarketView(event.id, "OPEN"))
+            message = await town_square.send(
+                content=await public_post_content(event, betting_enabled),
+                view=MarketView(event.id, "OPEN", betting_enabled),
+            )
         except discord.HTTPException as e:
             await event.delete()
             await _show_panel(interaction, self.guild_id, None, f"❌ Could not post to #town-square: `{e}`")
@@ -573,22 +598,22 @@ class NewMarketModal(discord.ui.DesignerModal):
         try:
             await message.pin(reason=f"Market #{event.id}")
         except discord.HTTPException as e:
-            print(f"[market] Could not pin market {event.id}: {e}")
+            log.warning(f"Could not pin market {event.id}: {e}")
 
-        print(f"[market] Opened market {event.id}: {question}")
+        log.info(f"Opened market {event.id}: {question}")
         await _show_panel(interaction, self.guild_id, event.id, f"✅ Market **#{event.id}** is live in {town_square.mention}.")
 
 
 class ResolveMarketModal(discord.ui.DesignerModal):
     def __init__(self, event: MarketEvent, pools: dict[str, int]):
         # Discord caps modal titles at 45 chars and label descriptions at 100
-        super().__init__(title=_truncate(f"Resolve #{event.id}: {event.question}", 45))
+        super().__init__(title=truncate(f"Resolve #{event.id}: {event.question}", 45))
         self.event_id = event.id
         self.guild_id = event.guild_id
 
         self.outcome_label = discord.ui.Label(
             label="Winning side",
-            description=_truncate(event.question, 100),
+            description=truncate(event.question, 100),
             item=discord.ui.Select(
                 select_type=discord.ComponentType.string_select,
                 placeholder="Choose the outcome — pays out immediately, can't be undone",
@@ -615,7 +640,7 @@ class ResolveMarketModal(discord.ui.DesignerModal):
         positions = await MarketPosition.filter(event_id=event.id)
         pool = sum(p.amount for p in positions)
         paid = sum(p.payout or 0 for p in positions)
-        print(f"[market] Resolved market {event.id} as {outcome}: {paid}/{pool} gold paid out")
+        log.info(f"Resolved market {event.id} as {outcome}: {paid}/{pool} gold paid out")
 
         await refresh_post(interaction.client, event.id)
         await notify_bettors(interaction.client, event)
@@ -655,7 +680,7 @@ class CancelMarketModal(discord.ui.DesignerModal):
             await _show_panel(interaction, self.guild_id, self.event_id, f"❌ {e}")
             return
 
-        print(f"[market] Cancelled market {event.id}: {reason}")
+        log.info(f"Cancelled market {event.id}: {reason}")
         await refresh_post(interaction.client, event.id)
         await notify_bettors(interaction.client, event)
         await _show_panel(interaction, self.guild_id, event.id, f"🚫 Market **#{event.id}** cancelled — all stakes refunded.")
@@ -692,7 +717,7 @@ class GMMarketView(discord.ui.View):
                 placeholder="Open a market...",
                 options=[
                     discord.SelectOption(
-                        label=_truncate(f"#{e.id} {e.question}", 100), value=str(e.id),
+                        label=truncate(f"#{e.id} {e.question}", 100), value=str(e.id),
                         description=e.status, emoji=STATUS_EMOJI[e.status],
                     )
                     for e in events
@@ -745,7 +770,15 @@ class GMMarketView(discord.ui.View):
         await interaction.response.defer()
         state.markets_enabled = not state.markets_enabled
         await state.save(update_fields=["markets_enabled"])
-        notice = "✅ Markets are now **open** to players." if state.markets_enabled else "🚫 Markets are now **closed** to players."
+        refreshed = await refresh_open_posts(interaction.client, self.guild_id)
+        log.info(f"Markets {'enabled' if state.markets_enabled else 'disabled'}; refreshed {refreshed} post(s)")
+
+        if state.markets_enabled:
+            notice = "✅ Markets are now **open** to players."
+        else:
+            notice = "🚫 Markets are now **closed** to players — no new bets can be placed."
+        if refreshed:
+            notice += f"\n*Updated the bet buttons on {refreshed} open market post(s).*"
         await _show_panel(interaction, self.guild_id, None, notice)
 
     async def close_betting(self, interaction: discord.Interaction):
@@ -758,7 +791,7 @@ class GMMarketView(discord.ui.View):
         except EconomyError as e:
             await _show_panel(interaction, self.guild_id, event.id, f"❌ {e}")
             return
-        print(f"[market] Closed betting on market {event.id}")
+        log.info(f"Closed betting on market {event.id}")
         await refresh_post(interaction.client, event.id)
         await _show_panel(interaction, self.guild_id, event.id, f"🔒 Betting closed on market **#{event.id}**.")
 
@@ -814,13 +847,18 @@ class MarketCog(commands.Cog):
         try:
             live = await MarketEvent.filter(status__in=["OPEN", "CLOSED"], message_id__isnull=False)
         except Exception as e:
-            # On a first boot the market tables may still be being created — nothing to restore then
-            print(f"[market] Could not restore market views: {e}")
+            # The schema is ready before the gateway connects (see bot.main), so this is belt-and-braces
+            log.exception("Could not restore market views")
             return
+        enabled: dict[int, bool] = {}
         for event in live:
-            self.bot.add_view(MarketView(event.id, event.status), message_id=event.message_id)
+            if event.guild_id not in enabled:
+                enabled[event.guild_id] = await _markets_enabled(event.guild_id)
+            self.bot.add_view(
+                MarketView(event.id, event.status, enabled[event.guild_id]), message_id=event.message_id
+            )
         if live:
-            print(f"[market] Restored {len(live)} market post(s)")
+            log.info(f"Restored {len(live)} market post(s)")
 
 
 def setup(bot: discord.Bot):
