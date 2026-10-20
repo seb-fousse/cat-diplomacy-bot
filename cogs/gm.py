@@ -195,6 +195,8 @@ class GMCog(commands.Cog):
         await player.save()
         log.info(f"Eliminated {player.faction_name} (player {player.id})")
 
+        await self._send_elimination_notification(guild, player)
+
         who = user.mention if user else f"**{player.faction_name}**"
         if failed:
             lines = "\n".join(f"— {f}" for f in failed)
@@ -231,6 +233,25 @@ class GMCog(commands.Cog):
                 log.warning(f"Could not lock {target.name}: {e}")
                 failed.append(f"{target.name} could not be made read-only ({e})")
         return failed
+
+    async def _send_elimination_notification(self, guild: discord.Guild, player: Player):
+        """Send an elimination notification to the player's diplomacy channel."""
+        safe_name = player.faction_name.lower().replace(" ", "-")
+        diplomacy_channel = discord.utils.get(guild.text_channels, name=f"{safe_name}-diplomacy")
+
+        if not diplomacy_channel:
+            log.warning(f"Could not find diplomacy channel for {player.faction_name}")
+            return
+
+        try:
+            await diplomacy_channel.send(
+                f"*A solemn telegram arrives, sealed with the mark of the cat diplomat.*\n\n"
+                f"**{player.faction_name}** has been eliminated from the game.\n\n"
+                f"Your channels remain accessible for record-keeping, but you may no longer submit orders or take actions.\n\n"
+                f"*The cat diplomat removes their top hat in respectful silence.*"
+            )
+        except discord.HTTPException as e:
+            log.warning(f"Could not send elimination notification to {diplomacy_channel.name}: {e}")
 
     # -------------------------------------------------------------------------
     # /gm speak
