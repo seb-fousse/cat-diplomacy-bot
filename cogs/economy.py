@@ -511,7 +511,7 @@ def _snapshots_csv(snapshots: list[BalanceSnapshot]) -> discord.File:
 async def _balance_lines(player: Player) -> str:
     locked = (await locked_gold(player.guild_id))[player.id]
     in_markets = f"\n🎲 balance locked up in markets - **{locked} gold**" if locked else ""
-    return f"💰 balance - **{player.gold_balance} gold**{in_markets}"
+    return f"💰 balance: **{player.gold_balance} gold**{in_markets}"
 
 
 async def _balance_message(player: Player, notice: str = "") -> str:
