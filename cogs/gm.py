@@ -1,6 +1,11 @@
 import asyncio
+import csv
+import io
 import logging
 import os
+import zipfile
+from datetime import datetime, timezone as dt_timezone
+
 import discord
 from discord.ext import commands
 from tortoise import Tortoise, timezone
@@ -15,6 +20,7 @@ log = logging.getLogger(__name__)
 setup_log = log.getChild("setup")
 teardown_log = log.getChild("teardown")
 turn_log = log.getChild("turn")
+export_log = log.getChild("export")
 
 
 class GMCog(commands.Cog):
@@ -251,6 +257,26 @@ class GMCog(commands.Cog):
 
         await channel.send(message)
         await ctx.followup.send(f"✅ Message sent to {channel.mention}.", ephemeral=True)
+
+    # -------------------------------------------------------------------------
+    # /gm export
+    # -------------------------------------------------------------------------
+
+    @gm.command(name="export", description="[GM] Export every database table as CSVs in a zip")
+    @commands.has_role("GM")
+    async def export(self, ctx: discord.ApplicationContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            filename, payload = await export_tables_zip(ctx.guild.id)
+        except Exception as e:
+            export_log.exception("Export failed")
+            await ctx.respond(f"❌ Export failed: `{e}`", ephemeral=True)
+            return
+        await ctx.respond(
+            content=f"📦 Database export — `{filename}`",
+            file=discord.File(payload, filename=filename),
+            ephemeral=True,
+        )
 
     # -------------------------------------------------------------------------
     # /gm orders
@@ -493,6 +519,37 @@ async def _post_turn_started(guild: discord.Guild, season: str, year: int):
             await game_log.send(f"🗓️ **{season} {year}** has begun. Orders are now open.")
         except Exception as e:
             turn_log.exception("Failed to post turn-start to game-log")
+
+
+async def export_tables_zip(guild_id: int) -> tuple[str, io.BytesIO]:
+    """Dump every table (bar sqlite_sequence) to CSV and pack them into a zip."""
+    conn = Tortoise.get_connection("default")
+    _, tables = await conn.execute_query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for table in (row["name"] for row in tables):
+            _, rows = await conn.execute_query(f'SELECT * FROM "{table}"')
+            _, columns = await conn.execute_query(f'PRAGMA table_info("{table}")')
+            headers = [column["name"] for column in columns]
+
+            text = io.StringIO()
+            writer = csv.writer(text)
+            writer.writerow(headers)
+            for row in rows:
+                writer.writerow([row[header] for header in headers])
+            archive.writestr(f"{table}.csv", text.getvalue())
+
+    buffer.seek(0)
+
+    state = await GameState.get_or_none(guild_id=guild_id)
+    turn = f"{state.season}-{state.year}" if state else "no-turn"
+    stamp = datetime.now(dt_timezone.utc).strftime("%Y%m%d-%H%M%S")
+    safe_turn = "".join(c if c.isalnum() or c in "-_" else "-" for c in turn)
+    return f"cat-diplomacy-{safe_turn}-{stamp}.zip", buffer
 
 
 async def turn_panel_message(guild_id: int, notice: str = "") -> str:
