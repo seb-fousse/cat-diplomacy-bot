@@ -72,7 +72,11 @@ def _orders_message(
 ) -> str:
     header = f"{notice}\n\n" if notice else ""
     deadline = f"{deadline_line}\n\n" if deadline_line else ""
-    status = "💾 *All changes saved.*" if orders == saved else "✏️ **Unsaved changes** — press **Save Orders** to keep them."
+    status = (
+        "💾 *Saved automatically.*"
+        if orders == saved
+        else "⚠️ **Not saved** — your latest change could not be stored. See the message above."
+    )
     if not orders:
         return f"{header}{deadline}*No orders yet.*\nUse **Add Order** to begin building your turn.\n\n{status}"
     body = "\n".join(f"{i}. {order}" for i, order in enumerate(orders, 1))
@@ -128,7 +132,9 @@ class AddOrderModal(discord.ui.DesignerModal):
         order = Order(unit=unit, order_type=order_type, target=target)
         self.cog.pending_orders.setdefault(self.user_id, []).append(order)
 
-        await self.cog.render(interaction, self.user_id)
+        await self.cog.autosave_and_render(
+            interaction, self.user_id, f"✅ **Added and saved:** {order}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +149,6 @@ class OrdersView(discord.ui.View):
 
         orders = cog.pending_orders.get(user_id, [])
         self.remove_last.disabled = self.clear_all.disabled = not orders
-        # An empty list can still be saved when it withdraws previously saved orders
-        self.save.disabled = not orders and orders == cog.saved_orders.get(user_id, [])
 
     @discord.ui.button(label="Add Order", style=discord.ButtonStyle.primary, emoji="➕")
     async def add_order(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -153,76 +157,19 @@ class OrdersView(discord.ui.View):
     @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.secondary, emoji="↩️")
     async def remove_last(self, button: discord.ui.Button, interaction: discord.Interaction):
         orders = self.cog.pending_orders.get(self.user_id, [])
+        notice = ""
         if orders:
             removed = orders.pop()
             log.info(f"Removed order for user {self.user_id}: {removed}")
-        await self.cog.render(interaction, self.user_id)
-
-    @discord.ui.button(label="Save Orders", style=discord.ButtonStyle.success, emoji="💾")
-    async def save(self, button: discord.ui.Button, interaction: discord.Interaction):
-        orders = self.cog.pending_orders.get(self.user_id, [])
-        game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
-        if not game_state:
-            await interaction.response.send_message(
-                "⚠️ The GM hasn't set the current turn yet. Ask them to run `/gm turn`.",
-                ephemeral=True,
-            )
-            return
-        if game_state.turn_status == "closed":
-            await interaction.response.send_message(
-                "⚠️ Submissions are closed for this turn. Wait for the GM to advance to the next turn.",
-                ephemeral=True,
-            )
-            return
-
-        faction = interaction.channel.category.name.removeprefix("🐱 ")
-
-        log.info(
-            f"Save from {interaction.user} ({faction}): {len(orders)} order(s)"
-            + "".join(f"\n  {i:>2}. {order}" for i, order in enumerate(orders, 1))
-        )
-
-        player = await Player.get_or_none(guild_id=interaction.guild.id, user_id=interaction.user.id)
-        if player and player.is_eliminated:
-            await interaction.response.send_message(
-                "⚠️ You have been eliminated and can no longer submit orders.", ephemeral=True
-            )
-            return
-        if player:
-            await OrderRecord.filter(
-                player=player, season=game_state.season, year=game_state.year, status="submitted"
-            ).delete()
-            now = datetime.now(timezone.utc)
-            if orders:
-                await OrderRecord.bulk_create([
-                    OrderRecord(
-                        player=player,
-                        season=game_state.season,
-                        year=game_state.year,
-                        unit=order.unit,
-                        order_type=order.order_type,
-                        target=order.target or None,
-                        status="submitted",
-                        submitted_at=now,
-                    )
-                    for order in orders
-                ])
-            self.cog.saved_orders[self.user_id] = list(orders)
-            notice = (
-                f"✅ **Orders saved for {faction}.** You can keep editing until orders close."
-                if orders else
-                f"🗑️ **Orders withdrawn for {faction}.** You have no orders saved for this turn."
-            )
-        else:
-            log.warning(f"No DB record for user {interaction.user.id} — orders not persisted")
-            notice = "⚠️ You're not registered as a player — orders were not saved. Ask the GM."
-
-        await self.cog.render(interaction, self.user_id, notice)
+            notice = f"↩️ **Removed and saved:** {removed}"
+        await self.cog.autosave_and_render(interaction, self.user_id, notice)
 
     @discord.ui.button(label="Clear All", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def clear_all(self, button: discord.ui.Button, interaction: discord.Interaction):
         self.cog.pending_orders[self.user_id] = []
-        await self.cog.render(interaction, self.user_id)
+        await self.cog.autosave_and_render(
+            interaction, self.user_id, "🗑️ **All orders cleared.** You have no orders saved for this turn."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +196,84 @@ class OrdersCog(commands.Cog):
 
     async def render(self, interaction: discord.Interaction, user_id: int, notice: str = ""):
         game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
+        content, view = self.panel(user_id, game_state, notice)
+        await interaction.response.edit_message(content=content, view=view)
+
+    async def autosave_and_render(
+        self, interaction: discord.Interaction, user_id: int, notice: str = ""
+    ):
+        """Persist the user's current orders, then redraw the panel.
+
+        Every edit (add, remove, clear) goes through here, so the database always
+        mirrors what the panel shows. If persisting isn't possible the pending list
+        is rolled back to what is actually stored, so the panel never shows orders
+        the GM won't see.
+        """
+        orders = self.pending_orders.get(user_id, [])
+
+        game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
+        if not game_state:
+            self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
+            await self.render(
+                interaction,
+                user_id,
+                "⚠️ The GM hasn't set the current turn yet, so your change wasn't saved. Ask them to run `/gm turn`.",
+            )
+            return
+        if game_state.turn_status == "closed":
+            self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
+            await self.render(
+                interaction,
+                user_id,
+                "⚠️ Submissions are closed for this turn, so your change wasn't saved. Wait for the GM to advance to the next turn.",
+            )
+            return
+
+        player = await Player.get_or_none(guild_id=interaction.guild.id, user_id=interaction.user.id)
+        if player and player.is_eliminated:
+            self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
+            await self.render(
+                interaction,
+                user_id,
+                "⚠️ You have been eliminated and can no longer submit orders.",
+            )
+            return
+        if not player:
+            log.warning(f"No DB record for user {interaction.user.id} — orders not persisted")
+            self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
+            await self.render(
+                interaction,
+                user_id,
+                "⚠️ You're not registered as a player — your change wasn't saved. Ask the GM.",
+            )
+            return
+
+        faction = interaction.channel.category.name.removeprefix("🐱 ")
+        log.info(
+            f"Autosave from {interaction.user} ({faction}): {len(orders)} order(s)"
+            + "".join(f"\n  {i:>2}. {order}" for i, order in enumerate(orders, 1))
+        )
+
+        await OrderRecord.filter(
+            player=player, season=game_state.season, year=game_state.year, status="submitted"
+        ).delete()
+        now = datetime.now(timezone.utc)
+        if orders:
+            await OrderRecord.bulk_create([
+                OrderRecord(
+                    player=player,
+                    season=game_state.season,
+                    year=game_state.year,
+                    unit=order.unit,
+                    order_type=order.order_type,
+                    target=order.target or None,
+                    status="submitted",
+                    submitted_at=now,
+                )
+                for order in orders
+            ])
+        self.saved_orders[user_id] = list(orders)
+
         content, view = self.panel(user_id, game_state, notice)
         await interaction.response.edit_message(content=content, view=view)
 
