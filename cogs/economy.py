@@ -605,6 +605,19 @@ async def _notify_recipient(bot: discord.Client, recipient: Player, sender: Play
         pass
 
 
+async def _notify_adjustment(bot: discord.Client, player: Player, tx: GoldTransaction):
+    try:
+        user = await bot.fetch_user(player.user_id)
+        direction = "added" if tx.transaction_type == "GM_GRANT" else "taken"
+        await user.send(
+            f"*A telegram arrives, sealed with the mark of the cat diplomat.*\n\n"
+            f"**{tx.amount} gold {direction}** — {tx.reason}\n"
+            f"Your new balance: **{tx.to_balance_after if tx.transaction_type == 'GM_GRANT' else tx.from_balance_after} gold**"
+        )
+    except (discord.Forbidden, discord.NotFound):
+        pass
+
+
 class GoldView(discord.ui.View):
     def __init__(self, player: Player, history: bool = False, page: int = 0, total_pages: int = 1):
         super().__init__(timeout=None)
@@ -767,6 +780,7 @@ class AdjustGoldModal(discord.ui.DesignerModal):
 
         log.info(f"GM adjust {player.faction_name}: {amount:+} (tx {tx.id}) — {reason}")
         await player.refresh_from_db()
+        await _notify_adjustment(interaction.client, player, tx)
         content, view = await gm_ledger_panel(
             self.guild_id, player,
             notice=f"✅ **{player.faction_name}** {amount:+} gold → now **{player.gold_balance} gold**.",
