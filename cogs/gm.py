@@ -140,7 +140,7 @@ class GMCog(commands.Cog):
         safe_name = faction.lower().replace(" ", "-")
         category = await guild.create_category(f"🐱 {faction}", overwrites=overwrites)
         await guild.create_text_channel(f"{safe_name}-diplomacy", category=category)
-        await guild.create_text_channel(f"{safe_name}-orders", category=category)
+        await guild.create_text_channel(f"{safe_name}-commands", category=category)
 
         await Player.create(
             guild_id=guild.id,
@@ -154,7 +154,7 @@ class GMCog(commands.Cog):
                 f"*A distinguished cat in a top hat slides a sealed envelope across the table.*\n\n"
                 f"Welcome to the game, **{faction}**. Your private channels have been prepared on the server.\n\n"
                 f"— `#{safe_name}-diplomacy` is for correspondence with the GM.\n"
-                f"— `#{safe_name}-orders` is where you submit your moves to me.\n\n"
+                f"— `#{safe_name}-commands` is where you submit your moves to me.\n\n"
                 f"*The cat diplomat tucks a paw into their waistcoat and vanishes.*"
             )
         except discord.Forbidden:
@@ -429,7 +429,7 @@ class GMCog(commands.Cog):
         # --- ⚔️ Resolving ---
         res = await guild.create_category("⚔️ Resolving", overwrites=read_only)
         await guild.create_text_channel("map-updates", category=res)
-        await guild.create_text_channel("public-orders", category=res)
+        await guild.create_text_channel("public-commands", category=res)
         await guild.create_text_channel("winter-summaries", category=res)
         # game-log is bot-only for posting
         await guild.create_text_channel("game-log", category=res, overwrites={

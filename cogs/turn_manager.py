@@ -189,14 +189,14 @@ class TurnManagerCog(commands.Cog):
             except Exception as e:
                 log.exception("Failed to post to game-log")
 
-        # Post all submitted orders to #public-orders, grouped by faction
-        public_orders = discord.utils.get(guild.text_channels, name="public-orders")
+        # Post all submitted orders to #public-commands, grouped by faction
+        public_orders = discord.utils.get(guild.text_channels, name="public-commands")
         if public_orders:
             try:
                 for message in _public_orders_messages(state, orders):
                     await public_orders.send(message)
             except Exception:
-                log.exception("Failed to post to public-orders")
+                log.exception("Failed to post to public-commands")
 
         state.turn_status = "closed"
         state.closed_at = timezone.now()

@@ -300,7 +300,7 @@ class OrdersCog(commands.Cog):
         if not (
             category
             and category.name.startswith("🐱 ")
-            and channel.name.endswith("-orders")
+            and channel.name.endswith("-commands")
         ):
             await ctx.respond(
                 "⚠️ This command can only be used in your private orders channel.",
