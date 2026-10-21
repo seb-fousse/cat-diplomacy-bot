@@ -15,8 +15,8 @@ from models import SEASONS, TurnMap
 MAP_DIR = Path(__file__).resolve().parent.parent / "data" / "maps"
 
 # #map is the game's one map channel: a pinned History button, then every turn's map in
-# order. Its posts are also the images /orders and History show, by link, so no panel ever
-# re-uploads a file.
+# order, the bottom one carrying a History button too. Its posts are also the images
+# /orders and History show, by link, so no panel ever re-uploads a file.
 MAP_CHANNEL = "map"
 MAP_TOPIC = "Every turn's map, in order. Press History on the pinned message to browse them."
 MAP_INTRO = (
@@ -182,13 +182,33 @@ async def _map_channel(guild: discord.Guild) -> discord.TextChannel:
         return channel
 
 
+async def _bottom_post_id(guild_id: int) -> int | None:
+    """The bottom map post in #map, which is the one carrying the History button. Discord
+    message ids grow with time, so the newest post has the largest — no need to store it."""
+    ids = await TurnMap.filter(guild_id=guild_id, message_id__isnull=False).values_list("message_id", flat=True)
+    return max(ids, default=None)
+
+
+async def _drop_history_button(channel: discord.TextChannel, message_id: int):
+    """Strip the History button from what used to be the bottom post. Best-effort: the post
+    may be gone, or may predate the button."""
+    try:
+        await channel.get_partial_message(message_id).edit(view=None)
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as e:
+        log.warning(f"Could not remove the History button from #{MAP_CHANNEL} post {message_id}: {e}")
+
+
 async def post_map(guild: discord.Guild, turn_map: TurnMap) -> str:
     """Show a saved map in #map. A replacement swaps the image on its existing post, so it
     keeps its place in the timeline; a new map — or one whose post is gone — goes at the
-    bottom. Returns what went wrong, or ""."""
+    bottom. Only the bottom post carries a History button (besides the pinned intro), so
+    posting there moves the button down from the previous one. Returns what went wrong, or ""."""
     file = map_file(turn_map)
     if file is None:
         return "image missing from disk"
+    bottom_id = await _bottom_post_id(guild.id)
     try:
         channel = await _map_channel(guild)
         if turn_map.message_id:
@@ -198,16 +218,24 @@ async def post_map(guild: discord.Guild, turn_map: TurnMap) -> str:
                 message = None
             if message:
                 # attachments=[] drops the previous image rather than adding alongside it
-                edited = await message.edit(content=_caption(turn_map), file=file, attachments=[])
+                edited = await message.edit(
+                    content=_caption(turn_map),
+                    file=file,
+                    attachments=[],
+                    view=HistoryButtonView() if message.id == bottom_id else None,
+                )
                 _remember_link(turn_map, edited)
                 return ""
-        message = await channel.send(content=_caption(turn_map), file=file)
+        message = await channel.send(content=_caption(turn_map), file=file, view=HistoryButtonView())
     except discord.HTTPException as e:
         log.warning(f"Could not post map for {map_label(turn_map)} to #{MAP_CHANNEL}: {e}")
         return str(e)
     turn_map.message_id = message.id
     await TurnMap.filter(id=turn_map.id).update(message_id=message.id)
     _remember_link(turn_map, message)
+    # Only once the new post has its button, so the bottom of #map is never without one
+    if bottom_id and bottom_id != message.id:
+        await _drop_history_button(channel, bottom_id)
     return ""
 
 
@@ -225,11 +253,11 @@ async def map_url(guild: discord.Guild, turn_map: TurnMap) -> str | None:
         if cached and time.time() < cached[1] - LINK_MARGIN_SECONDS:
             return cached[0]
 
-        # Another caller may have posted it while this one waited for the lock
-        stored = await TurnMap.filter(id=turn_map.id).values_list("message_id", flat=True)
-        if not stored:
+        # Reloaded, not trusted: another caller may have posted it while this one waited for
+        # the lock, and a replacement may have changed its file since the caller loaded it
+        turn_map = await TurnMap.get_or_none(id=turn_map.id)
+        if turn_map is None:
             return None  # deleted, e.g. by teardown
-        turn_map.message_id = stored[0]
         if turn_map.message_id:
             try:
                 channel = await _map_channel(guild)
@@ -273,12 +301,12 @@ async def forget_map_channel(guild_id: int):
 
 
 # ---------------------------------------------------------------------------
-# History — the pinned button in #map, and the private browser it opens
+# History — the button on #map's pinned message and bottom map, and the browser it opens
 # ---------------------------------------------------------------------------
 
 class HistoryButtonView(discord.ui.View):
-    """Persistent: the fixed custom_id lets one registration at startup serve the pinned
-    message on every server, across restarts."""
+    """Persistent: the fixed custom_id lets one registration at startup serve every History
+    button — the pinned message and the bottom map, on every server — across restarts."""
 
     def __init__(self):
         super().__init__(timeout=None)
