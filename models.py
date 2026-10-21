@@ -49,10 +49,28 @@ class GameState(Model):
     turn_status = fields.CharField(max_length=10, default="open")  # open | closed — GM-controlled, not auto-advanced
     closed_at = fields.DatetimeField(null=True)  # when the GM manually closed submissions for the current turn
     next_turn_reminder_sent_at = fields.DatetimeField(null=True)  # last time the "advance the turn" nudge fired
+    starting_map_message_id = fields.BigIntField(null=True)  # the starting map's post in #starting-map
+    map_updates_message_id = fields.BigIntField(null=True)   # the single #map-updates post, edited to the latest map
     updated_at = fields.DatetimeField(auto_now=True)
 
     class Meta:
         table = "game_state"
+
+
+class TurnMap(Model):
+    id          = fields.IntField(pk=True)
+    guild_id    = fields.BigIntField()
+    season      = fields.CharField(max_length=20)   # the turn this map opens — the board as it stands at its start
+    year        = fields.IntField()
+    file_path   = fields.CharField(max_length=500)  # local copy; Discord CDN links expire
+    filename    = fields.CharField(max_length=255)  # name the image is posted under, e.g. map-fall-1901.png
+    is_starting = fields.BooleanField(default=False)  # the first map of the game, posted to #starting-map
+    uploaded_by = fields.BigIntField()                # Discord user id
+    uploaded_at = fields.DatetimeField(auto_now=True)  # bumped on replacement, so the latest upload is the current map
+
+    class Meta:
+        table = "turn_maps"
+        unique_together = (("guild_id", "season", "year"),)
 
 
 class ConfessionalLog(Model):

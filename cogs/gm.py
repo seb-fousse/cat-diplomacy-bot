@@ -10,8 +10,8 @@ import discord
 from discord.ext import commands
 from tortoise import Tortoise, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from models import GameState, GoldTransaction, MarketEvent, Player, Order
-from cogs import economy, market
+from models import GameState, GoldTransaction, MarketEvent, Player, Order, TurnMap
+from cogs import economy, maps, market
 from formatting import DISCORD_MESSAGE_LIMIT, chunk_blocks, format_order, page_slice
 
 SERVER_TIPS_PATH = os.path.join(os.path.dirname(__file__), "..", "content", "server_tips.md")
@@ -399,6 +399,7 @@ class GMCog(commands.Cog):
             await GoldTransaction.filter(guild_id=guild.id).delete()
             await MarketEvent.filter(guild_id=guild.id).delete()
             await Player.filter(guild_id=guild.id).delete()
+            await maps.delete_guild_maps(guild.id)
 
             teardown_log.info("Done.")
         except Exception as e:
@@ -564,6 +565,13 @@ async def export_tables_zip(guild_id: int) -> tuple[str, io.BytesIO]:
                 writer.writerow([row[header] for header in headers])
             archive.writestr(f"{table}.csv", text.getvalue())
 
+        # The map images live on disk, not in the database
+        for turn_map in await TurnMap.filter(guild_id=guild_id).order_by("id"):
+            try:
+                archive.write(turn_map.file_path, f"maps/{turn_map.filename}")
+            except OSError as e:
+                export_log.warning(f"Map image for {maps.map_label(turn_map)} not exported: {e}")
+
     buffer.seek(0)
 
     state = await GameState.get_or_none(guild_id=guild_id)
@@ -587,6 +595,10 @@ async def turn_panel_message(guild_id: int, notice: str = "") -> str:
                 body += "⚠️ **Overdue — hit Next Turn!**\n"
         else:
             body += "**Status:** 🟢 Open for submissions\n"
+        if await TurnMap.exists(guild_id=guild_id, season=state.season, year=state.year):
+            body += "**Map:** 🗺️ Set for this turn\n"
+        else:
+            body += "**Map:** ⚠️ Not set for this turn — press **Set Map**\n"
         if state.close_weekdays and state.close_hour is not None:
             day_names = ", ".join(_ordered_days(state.close_weekdays))
             body += (
@@ -683,6 +695,8 @@ class TurnView(discord.ui.View):
         self.guild_id = guild_id
 
         # Only offer the actions that make sense for the current turn's status
+        if state is None:
+            self.remove_item(self.set_map)
         if state is None or state.turn_status != "open":
             self.remove_item(self.close_submissions)
         if state is None or state.turn_status != "closed":
@@ -692,6 +706,22 @@ class TurnView(discord.ui.View):
     async def set_turn(self, button: discord.ui.Button, interaction: discord.Interaction):
         state = await GameState.get_or_none(guild_id=self.guild_id)
         await interaction.response.send_modal(SetTurnModal(self.guild_id, state))
+
+    @discord.ui.button(label="Set Map", style=discord.ButtonStyle.primary, emoji="🗺️")
+    async def set_map(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if not state:
+            await interaction.response.send_message(
+                "⚠️ Set the turn first before setting the map.", ephemeral=True
+            )
+            return
+        if await TurnMap.exists(guild_id=self.guild_id, season=state.season, year=state.year):
+            description = "Replaces the map already set for this turn."
+        elif await TurnMap.exists(guild_id=self.guild_id):
+            description = "Posted to #map-updates and shown in every player's /orders."
+        else:
+            description = "The starting map — posted to #starting-map and #map-updates."
+        await interaction.response.send_modal(SetMapModal(self.guild_id, state, description))
 
     @discord.ui.button(label="Set Reminder Schedule", style=discord.ButtonStyle.primary, emoji="⏰")
     async def set_close_schedule(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -725,9 +755,114 @@ class TurnView(discord.ui.View):
                 "⚠️ Close submissions before advancing to the next turn.", ephemeral=True
             )
             return
+        # Advancing needs the resolved board, so the turn only moves once a map is uploaded
+        await interaction.response.send_modal(NextTurnModal(self.guild_id, state))
+
+
+def _map_upload_label(label: str, description: str) -> discord.ui.Label:
+    return discord.ui.Label(
+        label=label,
+        description=description,
+        item=discord.ui.FileUpload(required=True, max_values=1),
+    )
+
+
+def _uploaded_file(label: discord.ui.Label) -> discord.Attachment | None:
+    attachments = label.item.values or []
+    return attachments[0] if attachments else None
+
+
+async def _download_map(
+    interaction: discord.Interaction, guild_id: int, state: GameState, attachment: discord.Attachment,
+) -> bytes | None:
+    """Fetch an uploaded map after the interaction has been deferred. On failure the panel
+    says so and None comes back, so the caller can stop before changing anything."""
+    try:
+        return await attachment.read()
+    except discord.HTTPException as e:
+        turn_log.warning(f"Could not download map upload {attachment.filename}: {e}")
+        await interaction.edit_original_response(
+            content=await turn_panel_message(
+                guild_id, "❌ Could not download the map image — nothing was changed. Please try again."
+            ),
+            view=TurnView(guild_id, state),
+        )
+        return None
+
+
+class SetMapModal(discord.ui.DesignerModal):
+    def __init__(self, guild_id: int, state: GameState, description: str):
+        super().__init__(title="Set Map")
+        self.guild_id = guild_id
+
+        self.map_label = _map_upload_label(f"Map for {state.season} {state.year}", description)
+        self.add_item(self.map_label)
+
+    async def callback(self, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if not state:
+            await interaction.response.send_message("⚠️ Set the turn first before setting the map.", ephemeral=True)
+            return
+        attachment = _uploaded_file(self.map_label)
+        error = maps.check_map_upload(interaction.guild, attachment)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
         await interaction.response.defer()
+        data = await _download_map(interaction, self.guild_id, state, attachment)
+        if data is None:
+            return
+
+        turn_map = await maps.save_turn_map(
+            self.guild_id, state.season, state.year, attachment.filename, data, interaction.user.id
+        )
+        failed = await maps.publish_map(interaction.guild, turn_map)
+
+        kind = "Starting map" if turn_map.is_starting else "Map"
+        notice = f"✅ {kind} set for **{state.season} {state.year}**." + maps.publish_warning(failed)
+        await interaction.edit_original_response(
+            content=await turn_panel_message(self.guild_id, notice),
+            view=TurnView(self.guild_id, state),
+        )
+
+
+class NextTurnModal(discord.ui.DesignerModal):
+    def __init__(self, guild_id: int, state: GameState):
+        super().__init__(title="Next Turn")
+        self.guild_id = guild_id
 
         season, year = _next_season_year(state.season, state.year)
+        self.map_label = _map_upload_label(
+            f"Board after {state.season} {state.year}",
+            f"Becomes the map for {season} {year}, posted to #map-updates.",
+        )
+        self.add_item(self.map_label)
+
+    async def callback(self, interaction: discord.Interaction):
+        state = await GameState.get_or_none(guild_id=self.guild_id)
+        if not state or state.turn_status != "closed":
+            await interaction.response.send_message(
+                "⚠️ Close submissions before advancing to the next turn.", ephemeral=True
+            )
+            return
+        attachment = _uploaded_file(self.map_label)
+        error = maps.check_map_upload(interaction.guild, attachment)
+        if error:
+            await interaction.response.send_message(f"{error}\nThe turn was not advanced.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        data = await _download_map(interaction, self.guild_id, state, attachment)
+        if data is None:
+            return
+
+        season, year = _next_season_year(state.season, state.year)
+        # Saved before the turn moves, so a failure here leaves the game where it was
+        turn_map = await maps.save_turn_map(
+            self.guild_id, season, year, attachment.filename, data, interaction.user.id
+        )
+
         state.season = season
         state.year = year
         state.turn_status = "open"
@@ -735,10 +870,12 @@ class TurnView(discord.ui.View):
         state.next_turn_reminder_sent_at = None
         await state.save()
 
+        failed = await maps.publish_map(interaction.guild, turn_map)
         await _post_turn_started(interaction.guild, season, year)
 
+        notice = f"✅ Advanced to **{season} {year}**." + maps.publish_warning(failed)
         await interaction.edit_original_response(
-            content=await turn_panel_message(self.guild_id, f"✅ Advanced to **{season} {year}**."),
+            content=await turn_panel_message(self.guild_id, notice),
             view=TurnView(self.guild_id, state),
         )
         _schedule_map_channel_rename(interaction.guild, season, year)

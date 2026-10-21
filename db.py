@@ -76,6 +76,8 @@ async def _migrate():
         "closed_at": 'ALTER TABLE "game_state" ADD COLUMN "closed_at" TIMESTAMP',
         "next_turn_reminder_sent_at": 'ALTER TABLE "game_state" ADD COLUMN "next_turn_reminder_sent_at" TIMESTAMP',
         "close_timezone": 'ALTER TABLE "game_state" ADD COLUMN "close_timezone" VARCHAR(64) NOT NULL DEFAULT \'UTC\'',
+        "starting_map_message_id": 'ALTER TABLE "game_state" ADD COLUMN "starting_map_message_id" BIGINT',
+        "map_updates_message_id": 'ALTER TABLE "game_state" ADD COLUMN "map_updates_message_id" BIGINT',
     }
     for column, statement in game_state_columns.items():
         if column not in existing:
