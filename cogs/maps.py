@@ -1,16 +1,33 @@
+import asyncio
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import discord
+from discord.ext import commands
 from models import GameState, TurnMap
 
 # Each turn's map is kept on disk: #map-updates only ever shows the latest one, and
 # Discord CDN links expire, so this folder is the game's per-turn record of the board.
 MAP_DIR = Path(__file__).resolve().parent.parent / "data" / "maps"
 
+# Every map is also uploaded once to a GM-only channel, and panels show that copy by link
+# instead of re-uploading the file on each click. The disk copy stays the master: a
+# missing archive post is simply made again from it.
+ARCHIVE_CHANNEL = "map-archive"
+ARCHIVE_TOPIC = "Bot-managed copies of every turn's map — the player panels link to these. Please don't delete."
+LINK_MARGIN_SECONDS = 3600        # refresh a link this long before Discord expires it
+FALLBACK_LINK_SECONDS = 2 * 3600  # assumed lifetime for a link that doesn't carry its expiry
+
 log = logging.getLogger(__name__)
+
+_links: dict[int, tuple[str, float]] = {}  # map id -> (link, unix time it expires)
+_link_locks: dict[int, asyncio.Lock] = {}   # one refresh per map at a time, so nothing is archived twice
+_archive_channel_ids: dict[int, int] = {}  # guild id -> archive channel, ahead of the gateway's cache
+_archive_channel_lock = asyncio.Lock()
 
 
 def map_label(turn_map: TurnMap) -> str:
@@ -32,22 +49,23 @@ def check_map_upload(guild: discord.Guild, attachment: discord.Attachment | None
 
 
 async def save_turn_map(
-    guild_id: int, season: str, year: int, upload_filename: str, data: bytes, user_id: int
+    guild: discord.Guild, season: str, year: int, upload_filename: str, data: bytes, user_id: int
 ) -> TurnMap:
-    """Store the map for a turn, replacing any map already set for it. The first map of
-    the game is the starting map, and a replacement for that turn stays the starting map."""
+    """Store the map for a turn, replacing any map already set for it, and archive it. The
+    first map of the game is the starting map, and a replacement for that turn stays it."""
     extension = Path(upload_filename).suffix.lower() or ".png"
     filename = f"map-{season.lower()}-{year}{extension}"
-    folder = MAP_DIR / str(guild_id)
+    folder = MAP_DIR / str(guild.id)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / filename
     path.write_bytes(data)
 
-    turn_map = await TurnMap.get_or_none(guild_id=guild_id, season=season, year=year)
+    turn_map = await TurnMap.get_or_none(guild_id=guild.id, season=season, year=year)
+    replaced_archive_id = None
     if turn_map is None:
-        is_first = not await TurnMap.filter(guild_id=guild_id).exists()
-        return await TurnMap.create(
-            guild_id=guild_id,
+        is_first = not await TurnMap.filter(guild_id=guild.id).exists()
+        turn_map = await TurnMap.create(
+            guild_id=guild.id,
             season=season,
             year=year,
             file_path=str(path),
@@ -55,17 +73,26 @@ async def save_turn_map(
             is_starting=is_first,
             uploaded_by=user_id,
         )
+    else:
+        # A replacement in a different format lands at a new path — drop the old file
+        if turn_map.file_path != str(path):
+            try:
+                os.remove(turn_map.file_path)
+            except OSError:
+                pass
+        # The old archive post shows the old image, so it must never be linked again
+        replaced_archive_id = turn_map.archive_message_id
+        turn_map.file_path = str(path)
+        turn_map.filename = filename
+        turn_map.uploaded_by = user_id
+        turn_map.archive_message_id = None
+        await turn_map.save()
+        _links.pop(turn_map.id, None)
 
-    # A replacement in a different format lands at a new path — drop the old file
-    if turn_map.file_path != str(path):
-        try:
-            os.remove(turn_map.file_path)
-        except OSError:
-            pass
-    turn_map.file_path = str(path)
-    turn_map.filename = filename
-    turn_map.uploaded_by = user_id
-    await turn_map.save()
+    # A failed archive isn't fatal: the first panel to show this map archives it from disk
+    await archive_map(guild, turn_map)
+    if replaced_archive_id:
+        await _delete_archive_post(guild, replaced_archive_id)
     return turn_map
 
 
@@ -79,6 +106,103 @@ def map_file(turn_map: TurnMap) -> discord.File | None:
     except OSError as e:
         log.warning(f"Map image for {map_label(turn_map)} missing from disk: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Archive and links
+# ---------------------------------------------------------------------------
+
+def _link_expiry(url: str) -> float:
+    """Discord CDN links carry their expiry as a hex unix timestamp in the `ex` parameter."""
+    raw = parse_qs(urlparse(url).query).get("ex", [""])[0]
+    try:
+        return float(int(raw, 16))
+    except ValueError:
+        return time.time() + FALLBACK_LINK_SECONDS
+
+
+def _remember_link(turn_map: TurnMap, message: discord.Message) -> str | None:
+    if not message.attachments:
+        return None
+    url = message.attachments[0].url
+    _links[turn_map.id] = (url, _link_expiry(url))
+    return url
+
+
+async def _archive_channel(guild: discord.Guild) -> discord.TextChannel:
+    """The archive channel, created on first use for servers set up before it existed."""
+    async with _archive_channel_lock:
+        channel = guild.get_channel(_archive_channel_ids.get(guild.id, 0)) or discord.utils.get(
+            guild.text_channels, name=ARCHIVE_CHANNEL
+        )
+        if channel is None:
+            log.info(f"Creating #{ARCHIVE_CHANNEL} in guild {guild.id}")
+            gm_role = discord.utils.get(guild.roles, name="GM")
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            }
+            if gm_role:
+                overwrites[gm_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            channel = await guild.create_text_channel(
+                ARCHIVE_CHANNEL,
+                category=discord.utils.get(guild.categories, name="🎩 GM HQ"),
+                overwrites=overwrites,
+                topic=ARCHIVE_TOPIC,
+            )
+        _archive_channel_ids[guild.id] = channel.id
+        return channel
+
+
+async def archive_map(guild: discord.Guild, turn_map: TurnMap) -> str | None:
+    """Upload the map to the archive, remember the post, and return its image link —
+    or None if it couldn't be archived."""
+    file = map_file(turn_map)
+    if file is None:
+        return None
+    try:
+        channel = await _archive_channel(guild)
+        message = await channel.send(content=f"🗺️ **{map_label(turn_map)}**", file=file)
+    except discord.HTTPException as e:
+        log.warning(f"Could not archive map for {map_label(turn_map)}: {e}")
+        return None
+    turn_map.archive_message_id = message.id
+    await TurnMap.filter(id=turn_map.id).update(archive_message_id=message.id)
+    return _remember_link(turn_map, message)
+
+
+async def _delete_archive_post(guild: discord.Guild, message_id: int):
+    try:
+        channel = await _archive_channel(guild)
+        await channel.get_partial_message(message_id).delete()
+    except discord.HTTPException as e:
+        log.warning(f"Could not delete replaced archive post {message_id}: {e}")
+
+
+async def map_url(guild: discord.Guild, turn_map: TurnMap) -> str | None:
+    """A working link to the map's image: from memory while it's fresh, else a fresh link
+    from its archive post, else archived again from disk. None if there's no image at all."""
+    async with _link_locks.setdefault(turn_map.id, asyncio.Lock()):
+        cached = _links.get(turn_map.id)
+        if cached and time.time() < cached[1] - LINK_MARGIN_SECONDS:
+            return cached[0]
+
+        # Another caller may have archived it while this one waited for the lock
+        stored = await TurnMap.filter(id=turn_map.id).values_list("archive_message_id", flat=True)
+        if not stored:
+            return None  # deleted, e.g. by teardown
+        message_id = stored[0]
+        if message_id:
+            try:
+                channel = await _archive_channel(guild)
+                return _remember_link(turn_map, await channel.fetch_message(message_id))
+            except discord.NotFound:
+                log.info(f"Archive post for {map_label(turn_map)} is gone — archiving again")
+            except discord.HTTPException as e:
+                # Not proof the post is gone, so don't risk archiving a duplicate
+                log.warning(f"Could not refresh map link for {map_label(turn_map)}: {e}")
+                return None
+        return await archive_map(guild, turn_map)
 
 
 async def _post_or_edit(
@@ -147,5 +271,57 @@ def publish_warning(failed: list[str]) -> str:
 
 
 async def delete_guild_maps(guild_id: int):
+    """The archive posts go with #map-archive when teardown deletes GM HQ."""
+    for map_id in await TurnMap.filter(guild_id=guild_id).values_list("id", flat=True):
+        _links.pop(map_id, None)
+        _link_locks.pop(map_id, None)
+    _archive_channel_ids.pop(guild_id, None)
     await TurnMap.filter(guild_id=guild_id).delete()
     shutil.rmtree(MAP_DIR / str(guild_id), ignore_errors=True)
+
+
+async def forget_archive_posts(message_ids: set[int]):
+    """Drop the cached links of maps whose archive post was deleted. Their stored message
+    ids are kept on purpose: the next panel to show the map fetches the post, finds it gone
+    and archives the map again. Re-archiving here instead would race teardown, which
+    deletes #map-archive while the maps are still in the database."""
+    for map_id in await TurnMap.filter(archive_message_id__in=list(message_ids)).values_list("id", flat=True):
+        log.info(f"Archive post for map {map_id} was deleted — it will be archived again on next view")
+        _links.pop(map_id, None)
+
+
+async def forget_archive_channel(guild_id: int):
+    for map_id in await TurnMap.filter(guild_id=guild_id).values_list("id", flat=True):
+        _links.pop(map_id, None)
+    _archive_channel_ids.pop(guild_id, None)
+
+
+class MapsCog(commands.Cog):
+    """Keeps cached map links honest when someone deletes archive posts by hand — a cached
+    link would otherwise keep being served (and break) until it expired on its own."""
+
+    def __init__(self, bot: discord.Bot):
+        self.bot = bot
+
+    def _in_archive(self, channel_id: int) -> bool:
+        channel = self.bot.get_channel(channel_id)
+        return channel is not None and channel.name == ARCHIVE_CHANNEL
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        if self._in_archive(payload.channel_id):
+            await forget_archive_posts({payload.message_id})
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        if self._in_archive(payload.channel_id):
+            await forget_archive_posts(payload.message_ids)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        if channel.name == ARCHIVE_CHANNEL:
+            await forget_archive_channel(channel.guild.id)
+
+
+def setup(bot: discord.Bot):
+    bot.add_cog(MapsCog(bot))

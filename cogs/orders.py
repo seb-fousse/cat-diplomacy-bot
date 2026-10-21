@@ -74,10 +74,14 @@ def _orders_message(
     notice: str = "",
     deadline_line: str = "",
     shown_map: TurnMap | None = None,
+    map_shown: bool = False,
 ) -> str:
-    caption = (
-        f"🗺️ *Map — {maps.map_label(shown_map)}*\n\n" if shown_map else "🗺️ *No map posted yet.*\n\n"
-    )
+    if shown_map is None:
+        caption = "🗺️ *No map posted yet.*\n\n"
+    elif map_shown:
+        caption = f"🗺️ *Map — {maps.map_label(shown_map)}*\n\n"
+    else:
+        caption = f"🗺️ *Map — {maps.map_label(shown_map)} (image unavailable)*\n\n"
     header = f"{caption}{notice}\n\n" if notice else caption
     deadline = f"{deadline_line}\n\n" if deadline_line else ""
     status = (
@@ -96,11 +100,10 @@ def _orders_message(
 # ---------------------------------------------------------------------------
 
 class AddOrderModal(discord.ui.DesignerModal):
-    def __init__(self, cog: "OrdersCog", user_id: int, shown_map: TurnMap | None):
+    def __init__(self, cog: "OrdersCog", user_id: int):
         super().__init__(title="Add Order")
         self.cog = cog
         self.user_id = user_id
-        self.shown_map = shown_map
 
         self.unit_label = discord.ui.Label(label="Unit")
         self.unit_label.set_input_text(
@@ -142,7 +145,7 @@ class AddOrderModal(discord.ui.DesignerModal):
         self.cog.pending_orders.setdefault(self.user_id, []).append(order)
 
         await self.cog.autosave_and_render(
-            interaction, self.user_id, f"✅ **Added and saved:** {order}", self.shown_map
+            interaction, self.user_id, f"✅ **Added and saved:** {order}"
         )
 
 
@@ -151,18 +154,17 @@ class AddOrderModal(discord.ui.DesignerModal):
 # ---------------------------------------------------------------------------
 
 class OrdersActions(discord.ui.ActionRow):
-    def __init__(self, cog: "OrdersCog", user_id: int, shown_map: TurnMap | None):
+    def __init__(self, cog: "OrdersCog", user_id: int):
         super().__init__()
         self.cog = cog
         self.user_id = user_id
-        self.shown_map = shown_map
 
         orders = cog.pending_orders.get(user_id, [])
         self.remove_last.disabled = self.clear_all.disabled = not orders
 
     @discord.ui.button(label="Add Order", style=discord.ButtonStyle.primary, emoji="➕")
     async def add_order(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.send_modal(AddOrderModal(self.cog, self.user_id, self.shown_map))
+        await interaction.response.send_modal(AddOrderModal(self.cog, self.user_id))
 
     @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.secondary, emoji="↩️")
     async def remove_last(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -172,32 +174,28 @@ class OrdersActions(discord.ui.ActionRow):
             removed = orders.pop()
             log.info(f"Removed order for user {self.user_id}: {removed}")
             notice = f"↩️ **Removed and saved:** {removed}"
-        await self.cog.autosave_and_render(interaction, self.user_id, notice, self.shown_map)
+        await self.cog.autosave_and_render(interaction, self.user_id, notice)
 
     @discord.ui.button(label="Clear All", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def clear_all(self, button: discord.ui.Button, interaction: discord.Interaction):
         self.cog.pending_orders[self.user_id] = []
         await self.cog.autosave_and_render(
-            interaction,
-            self.user_id,
-            "🗑️ **All orders cleared.** You have no orders saved for this turn.",
-            self.shown_map,
+            interaction, self.user_id, "🗑️ **All orders cleared.** You have no orders saved for this turn."
         )
 
 
 class OrdersView(discord.ui.DesignerView):
-    """The map is attached to the panel message once, when /orders opens it. Every redraw
-    after that edits the message without touching its attachments, so each panel carries
-    the map it was opened with and the gallery keeps pointing at that attachment."""
+    """The map is shown by its #map-archive link rather than attached, so every redraw shows
+    the latest map — and swaps in a fresh link before the old one expires."""
 
-    def __init__(self, cog: "OrdersCog", user_id: int, text: str, shown_map: TurnMap | None):
+    def __init__(self, cog: "OrdersCog", user_id: int, text: str, shown_map: TurnMap | None, map_url: str | None):
         super().__init__(timeout=None)
-        if shown_map:
+        if shown_map and map_url:
             self.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(
-                f"attachment://{shown_map.filename}", description=f"Map — {maps.map_label(shown_map)}"
+                map_url, description=f"Map — {maps.map_label(shown_map)}"
             )))
         self.add_item(discord.ui.TextDisplay(text))
-        self.add_item(OrdersActions(cog, user_id, shown_map))
+        self.add_item(OrdersActions(cog, user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -211,34 +209,28 @@ class OrdersCog(commands.Cog):
         # Last-saved orders per user, for the unsaved-changes indicator
         self.saved_orders: dict[int, list[Order]] = {}
 
-    def panel(
-        self,
-        user_id: int,
-        game_state: GameState | None = None,
-        notice: str = "",
-        shown_map: TurnMap | None = None,
+    async def panel(
+        self, guild: discord.Guild, user_id: int, game_state: GameState | None = None, notice: str = ""
     ) -> OrdersView:
+        shown_map = await maps.latest_map(guild.id)
+        map_url = await maps.map_url(guild, shown_map) if shown_map else None
         text = _orders_message(
             self.pending_orders.get(user_id, []),
             self.saved_orders.get(user_id, []),
             notice,
             _deadline_line(game_state),
             shown_map,
+            map_url is not None,
         )
-        return OrdersView(self, user_id, text, shown_map)
+        return OrdersView(self, user_id, text, shown_map, map_url)
 
-    async def render(
-        self, interaction: discord.Interaction, user_id: int, notice: str = "", shown_map: TurnMap | None = None
-    ):
+    async def render(self, interaction: discord.Interaction, user_id: int, notice: str = ""):
         game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
-        await interaction.response.edit_message(view=self.panel(user_id, game_state, notice, shown_map))
+        view = await self.panel(interaction.guild, user_id, game_state, notice)
+        await interaction.response.edit_message(view=view)
 
     async def autosave_and_render(
-        self,
-        interaction: discord.Interaction,
-        user_id: int,
-        notice: str = "",
-        shown_map: TurnMap | None = None,
+        self, interaction: discord.Interaction, user_id: int, notice: str = ""
     ):
         """Persist the user's current orders, then redraw the panel.
 
@@ -256,7 +248,6 @@ class OrdersCog(commands.Cog):
                 interaction,
                 user_id,
                 "⚠️ The GM hasn't set the current turn yet, so your change wasn't saved. Ask them to run `/gm turn`.",
-                shown_map,
             )
             return
         if game_state.turn_status == "closed":
@@ -265,7 +256,6 @@ class OrdersCog(commands.Cog):
                 interaction,
                 user_id,
                 "⚠️ Submissions are closed for this turn, so your change wasn't saved. Wait for the GM to advance to the next turn.",
-                shown_map,
             )
             return
 
@@ -276,7 +266,6 @@ class OrdersCog(commands.Cog):
                 interaction,
                 user_id,
                 "⚠️ You have been eliminated and can no longer submit orders.",
-                shown_map,
             )
             return
         if not player:
@@ -286,7 +275,6 @@ class OrdersCog(commands.Cog):
                 interaction,
                 user_id,
                 "⚠️ You're not registered as a player — your change wasn't saved. Ask the GM.",
-                shown_map,
             )
             return
 
@@ -316,7 +304,8 @@ class OrdersCog(commands.Cog):
             ])
         self.saved_orders[user_id] = list(orders)
 
-        await interaction.response.edit_message(view=self.panel(user_id, game_state, notice, shown_map))
+        view = await self.panel(interaction.guild, user_id, game_state, notice)
+        await interaction.response.edit_message(view=view)
 
     @discord.slash_command(name="orders", description="Open the orders builder for this turn")
     async def orders(self, ctx: discord.ApplicationContext):
@@ -349,7 +338,7 @@ class OrdersCog(commands.Cog):
             )
             return
 
-        # Uploading the map can outlast Discord's 3s window for a first response
+        # A map that isn't archived yet is uploaded first, which can outlast Discord's 3s window
         await ctx.defer(ephemeral=True)
 
         saved: list[Order] = []
@@ -369,15 +358,8 @@ class OrdersCog(commands.Cog):
         self.saved_orders[ctx.author.id] = saved
         self.pending_orders[ctx.author.id] = list(saved)
 
-        shown_map = await maps.latest_map(ctx.guild.id)
-        file = maps.map_file(shown_map) if shown_map else None
-        if file is None:
-            # No map yet, or its image is gone — the panel goes without one
-            await ctx.respond(view=self.panel(ctx.author.id, game_state), ephemeral=True)
-            return
-        await ctx.respond(
-            view=self.panel(ctx.author.id, game_state, shown_map=shown_map), file=file, ephemeral=True
-        )
+        view = await self.panel(ctx.guild, ctx.author.id, game_state)
+        await ctx.respond(view=view, ephemeral=True)
 
 
 def setup(bot: discord.Bot):

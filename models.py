@@ -1,6 +1,8 @@
 from tortoise import fields
 from tortoise.models import Model
 
+SEASONS = ["Spring", "Fall", "Winter"]  # turn order within a year
+
 
 class Player(Model):
     id           = fields.IntField(pk=True)
@@ -65,6 +67,7 @@ class TurnMap(Model):
     file_path   = fields.CharField(max_length=500)  # local copy; Discord CDN links expire
     filename    = fields.CharField(max_length=255)  # name the image is posted under, e.g. map-fall-1901.png
     is_starting = fields.BooleanField(default=False)  # the first map of the game, posted to #starting-map
+    archive_message_id = fields.BigIntField(null=True)  # copy in #map-archive whose link panels show instead of re-uploading
     uploaded_by = fields.BigIntField()                # Discord user id
     uploaded_at = fields.DatetimeField(auto_now=True)  # bumped on replacement, so the latest upload is the current map
 

@@ -83,3 +83,8 @@ async def _migrate():
         if column not in existing:
             log.info(f"Adding game_state.{column} column")
             await conn.execute_script(statement)
+
+    _, rows = await conn.execute_query("PRAGMA table_info(turn_maps)")
+    if not any(row["name"] == "archive_message_id" for row in rows):
+        log.info("Adding turn_maps.archive_message_id column")
+        await conn.execute_script('ALTER TABLE "turn_maps" ADD COLUMN "archive_message_id" BIGINT')

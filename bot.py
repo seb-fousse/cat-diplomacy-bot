@@ -37,6 +37,7 @@ log = logging.getLogger("bot")
 
 bot = discord.Bot(debug_guilds=[int(os.getenv("DEV_GUILD_ID"))])
 
+bot.load_extension("cogs.maps")
 bot.load_extension("cogs.orders")
 bot.load_extension("cogs.economy")
 bot.load_extension("cogs.market")

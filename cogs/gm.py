@@ -9,7 +9,7 @@ import discord
 from discord.ext import commands
 from tortoise import Tortoise, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from models import GameState, GoldTransaction, MarketEvent, Player, Order, TurnMap
+from models import SEASONS, GameState, GoldTransaction, MarketEvent, Player, Order, TurnMap
 from cogs import economy, maps, market
 from formatting import DISCORD_MESSAGE_LIMIT, chunk_blocks, format_order, page_slice
 
@@ -486,13 +486,13 @@ class GMCog(commands.Cog):
         gm_cat = await guild.create_category("🎩 GM HQ", overwrites=overwrites)
         await guild.create_text_channel("gm-chat", category=gm_cat)
         await guild.create_text_channel("gm-commands", category=gm_cat)
+        await guild.create_text_channel(maps.ARCHIVE_CHANNEL, category=gm_cat, topic=maps.ARCHIVE_TOPIC)
 
 
 # ---------------------------------------------------------------------------
 # GM UI — /gm turn opens the turn control panel
 # ---------------------------------------------------------------------------
 
-SEASONS = ["Spring", "Fall", "Winter"]
 CLOSE_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")  # week order, for storage and display
 VALID_CLOSE_DAYS = set(CLOSE_DAYS)
 OVERDUE_HOURS = 12  # matches TurnManagerCog.OVERDUE_THRESHOLD
@@ -793,7 +793,7 @@ class SetMapModal(discord.ui.DesignerModal):
             return
 
         turn_map = await maps.save_turn_map(
-            self.guild_id, state.season, state.year, attachment.filename, data, interaction.user.id
+            interaction.guild, state.season, state.year, attachment.filename, data, interaction.user.id
         )
         failed = await maps.publish_map(interaction.guild, turn_map)
 
@@ -838,7 +838,7 @@ class NextTurnModal(discord.ui.DesignerModal):
         season, year = _next_season_year(state.season, state.year)
         # Saved before the turn moves, so a failure here leaves the game where it was
         turn_map = await maps.save_turn_map(
-            self.guild_id, season, year, attachment.filename, data, interaction.user.id
+            interaction.guild, season, year, attachment.filename, data, interaction.user.id
         )
 
         state.season = season
