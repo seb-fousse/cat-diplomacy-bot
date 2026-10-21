@@ -76,15 +76,21 @@ async def _migrate():
         "closed_at": 'ALTER TABLE "game_state" ADD COLUMN "closed_at" TIMESTAMP',
         "next_turn_reminder_sent_at": 'ALTER TABLE "game_state" ADD COLUMN "next_turn_reminder_sent_at" TIMESTAMP',
         "close_timezone": 'ALTER TABLE "game_state" ADD COLUMN "close_timezone" VARCHAR(64) NOT NULL DEFAULT \'UTC\'',
-        "starting_map_message_id": 'ALTER TABLE "game_state" ADD COLUMN "starting_map_message_id" BIGINT',
-        "map_updates_message_id": 'ALTER TABLE "game_state" ADD COLUMN "map_updates_message_id" BIGINT',
     }
     for column, statement in game_state_columns.items():
         if column not in existing:
             log.info(f"Adding game_state.{column} column")
             await conn.execute_script(statement)
 
+    # game_state.starting_map_message_id and map_updates_message_id may linger from when
+    # maps were spread over three channels — unused since #map, and harmless to leave
     _, rows = await conn.execute_query("PRAGMA table_info(turn_maps)")
-    if not any(row["name"] == "archive_message_id" for row in rows):
-        log.info("Adding turn_maps.archive_message_id column")
-        await conn.execute_script('ALTER TABLE "turn_maps" ADD COLUMN "archive_message_id" BIGINT')
+    existing = {row["name"] for row in rows}
+    # Its post was a copy in #map-archive; it's now the map's one post in #map. The old ids
+    # point at the old channel, so each map is simply posted to #map the next time it's shown.
+    if "archive_message_id" in existing and "message_id" not in existing:
+        log.info("Renaming turn_maps.archive_message_id -> message_id")
+        await conn.execute_script('ALTER TABLE "turn_maps" RENAME COLUMN "archive_message_id" TO "message_id"')
+    elif "message_id" not in existing:
+        log.info("Adding turn_maps.message_id column")
+        await conn.execute_script('ALTER TABLE "turn_maps" ADD COLUMN "message_id" BIGINT')

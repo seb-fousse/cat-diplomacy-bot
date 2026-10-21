@@ -51,8 +51,6 @@ class GameState(Model):
     turn_status = fields.CharField(max_length=10, default="open")  # open | closed — GM-controlled, not auto-advanced
     closed_at = fields.DatetimeField(null=True)  # when the GM manually closed submissions for the current turn
     next_turn_reminder_sent_at = fields.DatetimeField(null=True)  # last time the "advance the turn" nudge fired
-    starting_map_message_id = fields.BigIntField(null=True)  # the starting map's post in #starting-map
-    map_updates_message_id = fields.BigIntField(null=True)   # the single #map-updates post, edited to the latest map
     updated_at = fields.DatetimeField(auto_now=True)
 
     class Meta:
@@ -66,8 +64,8 @@ class TurnMap(Model):
     year        = fields.IntField()
     file_path   = fields.CharField(max_length=500)  # local copy; Discord CDN links expire
     filename    = fields.CharField(max_length=255)  # name the image is posted under, e.g. map-fall-1901.png
-    is_starting = fields.BooleanField(default=False)  # the first map of the game, posted to #starting-map
-    archive_message_id = fields.BigIntField(null=True)  # copy in #map-archive whose link panels show instead of re-uploading
+    is_starting = fields.BooleanField(default=False)  # the first map of the game, captioned as the starting map
+    message_id  = fields.BigIntField(null=True)       # its post in #map, whose link panels show instead of re-uploading
     uploaded_by = fields.BigIntField()                # Discord user id
     uploaded_at = fields.DatetimeField(auto_now=True)  # bumped on replacement, so the latest upload is the current map
 

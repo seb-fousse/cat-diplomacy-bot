@@ -440,14 +440,13 @@ class GMCog(commands.Cog):
 
         # --- 📚 Reference ---
         ref = await guild.create_category("📚 Reference", overwrites=read_only)
-        await guild.create_text_channel("starting-map", category=ref)
+        await maps.create_map_channel(guild, ref)
         tips_ch = await guild.create_text_channel("server-tips", category=ref)
         await self._post_server_tips(tips_ch)
         await guild.create_text_channel("rules", category=ref)
 
         # --- ⚔️ Resolving ---
         res = await guild.create_category("⚔️ Resolving", overwrites=read_only)
-        await guild.create_text_channel("map-updates", category=res)
         await guild.create_text_channel("public-commands", category=res)
         await guild.create_text_channel("winter-summaries", category=res)
         # game-log is bot-only for posting
@@ -486,7 +485,6 @@ class GMCog(commands.Cog):
         gm_cat = await guild.create_category("🎩 GM HQ", overwrites=overwrites)
         await guild.create_text_channel("gm-chat", category=gm_cat)
         await guild.create_text_channel("gm-commands", category=gm_cat)
-        await guild.create_text_channel(maps.ARCHIVE_CHANNEL, category=gm_cat, topic=maps.ARCHIVE_TOPIC)
 
 
 # ---------------------------------------------------------------------------
@@ -694,11 +692,11 @@ class TurnView(discord.ui.View):
             )
             return
         if await TurnMap.exists(guild_id=self.guild_id, season=state.season, year=state.year):
-            description = "Replaces the map already set for this turn."
+            description = "Replaces this turn's map, in place in #map."
         elif await TurnMap.exists(guild_id=self.guild_id):
-            description = "Posted to #map-updates and shown in every player's /orders."
+            description = "Posted to #map and shown in every player's /orders."
         else:
-            description = "The starting map — posted to #starting-map and #map-updates."
+            description = "The starting map — the first post in #map."
         await interaction.response.send_modal(SetMapModal(self.guild_id, state, description))
 
     @discord.ui.button(label="Set Reminder Schedule", style=discord.ButtonStyle.primary, emoji="⏰")
@@ -793,12 +791,12 @@ class SetMapModal(discord.ui.DesignerModal):
             return
 
         turn_map = await maps.save_turn_map(
-            interaction.guild, state.season, state.year, attachment.filename, data, interaction.user.id
+            self.guild_id, state.season, state.year, attachment.filename, data, interaction.user.id
         )
-        failed = await maps.publish_map(interaction.guild, turn_map)
+        error = await maps.post_map(interaction.guild, turn_map)
 
         kind = "Starting map" if turn_map.is_starting else "Map"
-        notice = f"✅ {kind} set for **{state.season} {state.year}**." + maps.publish_warning(failed)
+        notice = f"✅ {kind} set for **{state.season} {state.year}**." + maps.post_warning(error)
         await interaction.edit_original_response(
             content=await turn_panel_message(self.guild_id, notice),
             view=TurnView(self.guild_id, state),
@@ -813,7 +811,7 @@ class NextTurnModal(discord.ui.DesignerModal):
         season, year = _next_season_year(state.season, state.year)
         self.map_label = _map_upload_label(
             f"Board after {state.season} {state.year}",
-            f"Becomes the map for {season} {year}, posted to #map-updates.",
+            f"Becomes the map for {season} {year}, posted to #map.",
         )
         self.add_item(self.map_label)
 
@@ -838,7 +836,7 @@ class NextTurnModal(discord.ui.DesignerModal):
         season, year = _next_season_year(state.season, state.year)
         # Saved before the turn moves, so a failure here leaves the game where it was
         turn_map = await maps.save_turn_map(
-            interaction.guild, season, year, attachment.filename, data, interaction.user.id
+            self.guild_id, season, year, attachment.filename, data, interaction.user.id
         )
 
         state.season = season
@@ -848,10 +846,10 @@ class NextTurnModal(discord.ui.DesignerModal):
         state.next_turn_reminder_sent_at = None
         await state.save()
 
-        failed = await maps.publish_map(interaction.guild, turn_map)
+        error = await maps.post_map(interaction.guild, turn_map)
         await _post_turn_started(interaction.guild, season, year)
 
-        notice = f"✅ Advanced to **{season} {year}**." + maps.publish_warning(failed)
+        notice = f"✅ Advanced to **{season} {year}**." + maps.post_warning(error)
         await interaction.edit_original_response(
             content=await turn_panel_message(self.guild_id, notice),
             view=TurnView(self.guild_id, state),

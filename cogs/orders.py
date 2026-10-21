@@ -185,7 +185,7 @@ class OrdersActions(discord.ui.ActionRow):
 
 
 class OrdersView(discord.ui.DesignerView):
-    """The map is shown by its #map-archive link rather than attached, so every redraw shows
+    """The map is shown by its #map post's link rather than attached, so every redraw shows
     the latest map — and swaps in a fresh link before the old one expires."""
 
     def __init__(self, cog: "OrdersCog", user_id: int, text: str, shown_map: TurnMap | None, map_url: str | None):
@@ -338,7 +338,7 @@ class OrdersCog(commands.Cog):
             )
             return
 
-        # A map that isn't archived yet is uploaded first, which can outlast Discord's 3s window
+        # A map that isn't in #map yet is uploaded first, which can outlast Discord's 3s window
         await ctx.defer(ephemeral=True)
 
         saved: list[Order] = []

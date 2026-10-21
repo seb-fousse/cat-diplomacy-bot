@@ -14,7 +14,8 @@ Each player gets two private channels, visible only to you and the GMs:
 **Public channels worth knowing**
 — `#town-square` — general public chat between players
 — `#confessional` — anonymous posts from any player
-— `#map-updates` / `#public-orders` / `#winter-summaries` — results as turns resolve
-— `#rules` / `#starting-map` — reference material for the game
+— `#map` — every turn's map in order, latest at the bottom; the pinned **History** button steps through them
+— `#public-orders` / `#winter-summaries` — results as turns resolve
+— `#rules` — reference material for the game
 
 Good luck out there. 🎩
