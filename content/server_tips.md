@@ -11,7 +11,6 @@ Each player gets two private channels, visible only to you and the GMs:
 — `/gold` — open your treasury panel: check your balance, send gold to another player, or review your transaction history
 
 **Public channels worth knowing**
-— `#current-map` — the current season and year
 — `#town-square` — general public chat between players
 — `#confessional` — anonymous posts from any player
 — `#map-updates` / `#public-orders` / `#winter-summaries` — results as turns resolve

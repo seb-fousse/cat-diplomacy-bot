@@ -1,4 +1,3 @@
-import asyncio
 import csv
 import io
 import logging
@@ -445,8 +444,6 @@ class GMCog(commands.Cog):
         tips_ch = await guild.create_text_channel("server-tips", category=ref)
         await self._post_server_tips(tips_ch)
         await guild.create_text_channel("rules", category=ref)
-        map_ch = await guild.create_text_channel("current-map", category=ref)
-        await map_ch.edit(topic="Current season & year — updated by the bot each turn")
 
         # --- ⚔️ Resolving ---
         res = await guild.create_category("⚔️ Resolving", overwrites=read_only)
@@ -513,25 +510,6 @@ def _next_season_year(season: str, year: int) -> tuple[str, int]:
     if idx == len(SEASONS) - 1:
         return SEASONS[0], year + 1
     return SEASONS[idx + 1], year
-
-
-async def _rename_current_map_channel(guild: discord.Guild, season: str, year: int):
-    """Best-effort — always scheduled as a background task, never awaited before an interaction
-    response. Discord rate-limits channel renames to ~2 per 10 minutes and discord.py's HTTP
-    client sleeps through that limit rather than failing fast, which can take minutes — far
-    longer than the 3s window Discord gives an interaction to respond."""
-    channel_name = f"current-map-{season.lower()}-{year}"
-    for channel in guild.text_channels:
-        if channel.name.startswith("current-map"):
-            try:
-                await channel.edit(name=channel_name)
-            except Exception as e:
-                turn_log.warning(f"Could not rename channel {channel.name} -> {channel_name}: {e}")
-            break
-
-
-def _schedule_map_channel_rename(guild: discord.Guild, season: str, year: int):
-    asyncio.create_task(_rename_current_map_channel(guild, season, year))
 
 
 async def _post_turn_started(guild: discord.Guild, season: str, year: int):
@@ -878,7 +856,6 @@ class NextTurnModal(discord.ui.DesignerModal):
             content=await turn_panel_message(self.guild_id, notice),
             view=TurnView(self.guild_id, state),
         )
-        _schedule_map_channel_rename(interaction.guild, season, year)
 
 
 class SetTurnModal(discord.ui.DesignerModal):
@@ -937,7 +914,6 @@ class SetTurnModal(discord.ui.DesignerModal):
             content=await turn_panel_message(self.guild_id, f"✅ Turn set to **{season} {year}**."),
             view=TurnView(self.guild_id, state),
         )
-        _schedule_map_channel_rename(interaction.guild, season, year)
 
 
 class SetCloseScheduleModal(discord.ui.DesignerModal):
