@@ -27,6 +27,25 @@ def _fixed_set_component_from_item(self, item):
 
 _Label._set_component_from_item = _fixed_set_component_from_item
 
+
+# Order-type dropdown options. Spring/Fall get the four movement orders; Winter is an
+# adjustment turn where players only build (ADD) or disband (REMOVE) units.
+MOVEMENT_ORDER_OPTIONS = [
+    discord.SelectOption(label="Move", value="MOVE", description="Move a unit to an adjacent territory", emoji="⚔️"),
+    discord.SelectOption(label="Hold", value="HOLD", description="Hold a unit in place", emoji="🛡️"),
+    discord.SelectOption(label="Support", value="SUPPORT", description="Support another unit's move or hold", emoji="🤝"),
+    discord.SelectOption(label="Convoy", value="CONVOY", description="Fleet convoys an army across water", emoji="⛵"),
+]
+WINTER_ORDER_OPTIONS = [
+    discord.SelectOption(label="Add", value="ADD", description="Build a new unit", emoji="➕"),
+    discord.SelectOption(label="Remove", value="REMOVE", description="Disband a unit", emoji="➖"),
+]
+
+
+def is_winter(season: str | None) -> bool:
+    return season == "Winter"
+
+
 @dataclass
 class Order:
     unit: str
@@ -42,6 +61,10 @@ class Order:
             return f"{self.unit} — SUPPORTS {self.target}"
         if self.order_type == "CONVOY":
             return f"{self.unit} — CONVOYS {self.target}"
+        if self.order_type == "ADD":
+            return f"{self.unit} — ADD"
+        if self.order_type == "REMOVE":
+            return f"{self.unit} — REMOVE"
         return f"{self.unit} — {self.order_type} {self.target}"
 
 
@@ -75,6 +98,7 @@ def _orders_message(
     deadline_line: str = "",
     shown_map: TurnMap | None = None,
     map_shown: bool = False,
+    season: str | None = None,
 ) -> str:
     if shown_map is None:
         caption = "🗺️ *No map posted yet.*\n\n"
@@ -82,6 +106,8 @@ def _orders_message(
         caption = f"🗺️ *Map — {maps.map_label(shown_map)}*\n\n"
     else:
         caption = f"🗺️ *Map — {maps.map_label(shown_map)} (image unavailable)*\n\n"
+    if is_winter(season):
+        caption += "❄️ *Winter adjustments — add or remove units.*\n\n"
     header = f"{caption}{notice}\n\n" if notice else caption
     deadline = f"{deadline_line}\n\n" if deadline_line else ""
     status = (
@@ -100,8 +126,9 @@ def _orders_message(
 # ---------------------------------------------------------------------------
 
 class AddOrderModal(discord.ui.DesignerModal):
-    def __init__(self, cog: "OrdersCog", user_id: int):
-        super().__init__(title="Add Order")
+    def __init__(self, cog: "OrdersCog", user_id: int, season: str | None = None):
+        self.winter = is_winter(season)
+        super().__init__(title="Winter Adjustment" if self.winter else "Add Order")
         self.cog = cog
         self.user_id = user_id
 
@@ -115,31 +142,28 @@ class AddOrderModal(discord.ui.DesignerModal):
             label="Order Type",
             item=discord.ui.Select(
                 select_type=discord.ComponentType.string_select,
-                placeholder="Choose an order type...",
-                options=[
-                    discord.SelectOption(label="Move", value="MOVE", description="Move a unit to an adjacent territory", emoji="⚔️"),
-                    discord.SelectOption(label="Hold", value="HOLD", description="Hold a unit in place", emoji="🛡️"),
-                    discord.SelectOption(label="Support", value="SUPPORT", description="Support another unit's move or hold", emoji="🤝"),
-                    discord.SelectOption(label="Convoy", value="CONVOY", description="Fleet convoys an army across water", emoji="⛵"),
-                ],
+                placeholder="Choose an order type..." if not self.winter else "Add or remove this unit...",
+                options=WINTER_ORDER_OPTIONS if self.winter else MOVEMENT_ORDER_OPTIONS,
             ),
         )
 
-        self.target_label = discord.ui.Label(label="Target / Details  (leave blank for HOLD)")
-        self.target_label.set_input_text(
-            placeholder="e.g.  Burgundy  |  Army Marseilles - Burgundy",
-            max_length=100,
-        )
-        self.target_label.item.required = False  # setter writes directly to underlying component
-
         self.add_item(self.unit_label)
         self.add_item(self.order_type_label)
-        self.add_item(self.target_label)
+
+        # Winter builds/disbands are just unit + add/remove — no target to specify.
+        if not self.winter:
+            self.target_label = discord.ui.Label(label="Target / Details  (leave blank for HOLD)")
+            self.target_label.set_input_text(
+                placeholder="e.g.  Burgundy  |  Army Marseilles - Burgundy",
+                max_length=100,
+            )
+            self.target_label.item.required = False  # setter writes directly to underlying component
+            self.add_item(self.target_label)
 
     async def callback(self, interaction: discord.Interaction):
         order_type = self.order_type_label.item.values[0]
         unit = self.unit_label.item.value.strip()
-        target = (self.target_label.item.value or "").strip()
+        target = "" if self.winter else (self.target_label.item.value or "").strip()
 
         order = Order(unit=unit, order_type=order_type, target=target)
         self.cog.pending_orders.setdefault(self.user_id, []).append(order)
@@ -154,17 +178,18 @@ class AddOrderModal(discord.ui.DesignerModal):
 # ---------------------------------------------------------------------------
 
 class OrdersActions(discord.ui.ActionRow):
-    def __init__(self, cog: "OrdersCog", user_id: int):
+    def __init__(self, cog: "OrdersCog", user_id: int, season: str | None = None):
         super().__init__()
         self.cog = cog
         self.user_id = user_id
+        self.season = season
 
         orders = cog.pending_orders.get(user_id, [])
         self.remove_last.disabled = self.clear_all.disabled = not orders
 
     @discord.ui.button(label="Add Order", style=discord.ButtonStyle.primary, emoji="➕")
     async def add_order(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.send_modal(AddOrderModal(self.cog, self.user_id))
+        await interaction.response.send_modal(AddOrderModal(self.cog, self.user_id, self.season))
 
     @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.secondary, emoji="↩️")
     async def remove_last(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -188,14 +213,14 @@ class OrdersView(discord.ui.DesignerView):
     """The map is shown by its #map post's link rather than attached, so every redraw shows
     the latest map — and swaps in a fresh link before the old one expires."""
 
-    def __init__(self, cog: "OrdersCog", user_id: int, text: str, shown_map: TurnMap | None, map_url: str | None):
+    def __init__(self, cog: "OrdersCog", user_id: int, text: str, shown_map: TurnMap | None, map_url: str | None, season: str | None = None):
         super().__init__(timeout=None)
         if shown_map and map_url:
             self.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(
                 map_url, description=f"Map — {maps.map_label(shown_map)}"
             )))
         self.add_item(discord.ui.TextDisplay(text))
-        self.add_item(OrdersActions(cog, user_id))
+        self.add_item(OrdersActions(cog, user_id, season))
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +239,7 @@ class OrdersCog(commands.Cog):
     ) -> OrdersView:
         shown_map = await maps.latest_map(guild.id)
         map_url = await maps.map_url(guild, shown_map) if shown_map else None
+        season = game_state.season if game_state else None
         text = _orders_message(
             self.pending_orders.get(user_id, []),
             self.saved_orders.get(user_id, []),
@@ -221,8 +247,9 @@ class OrdersCog(commands.Cog):
             _deadline_line(game_state),
             shown_map,
             map_url is not None,
+            season,
         )
-        return OrdersView(self, user_id, text, shown_map, map_url)
+        return OrdersView(self, user_id, text, shown_map, map_url, season)
 
     async def render(self, interaction: discord.Interaction, user_id: int, notice: str = ""):
         game_state = await GameState.get_or_none(guild_id=interaction.guild.id)

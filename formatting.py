@@ -14,6 +14,10 @@ def format_order(order) -> str:
         return f"{order.unit} — HOLDS"
     if order.order_type == "MOVE":
         return f"{order.unit} — MOVE to {order.target}"
+    if order.order_type == "ADD":
+        return f"{order.unit} — ADD"
+    if order.order_type == "REMOVE":
+        return f"{order.unit} — REMOVE"
     return f"{order.unit} — {order.order_type} {order.target or ''}"
 
 
