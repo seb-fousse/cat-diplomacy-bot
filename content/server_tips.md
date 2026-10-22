@@ -9,13 +9,13 @@ Each player gets two private channels, visible only to you and the GMs:
 — `/orders` — open the order builder to add and remove moves for the current turn. Press **Save Orders** to lock them in — the panel flags any unsaved changes. You can keep editing and re-saving until orders close; saving an empty list withdraws your orders
 — `/confessional` — post a message, image, or voice note anonymously to `#confessional`
 — `/gold` — open your treasury panel: check your balance, send gold to another player, or review your transaction history
-- `/markets` - meow
+- `/markets` - ???
 
 **Public channels worth knowing**
 — `#town-square` — general public chat between players
 — `#confessional` — anonymous posts from any player
 — `#map` — every turn's map in order, latest at the bottom; press **History** (under the latest map, or on the pinned message) to step through them
-— `#public-orders` / `#winter-summaries` — results as turns resolve
 — `#rules` — reference material for the game
+— `#public-orders` / `#winter-summaries` — results as turns resolve
 
-Good luck out there. 🎩
+Good luck out there!
