@@ -1,7 +1,6 @@
 import csv
 import io
 import logging
-import os
 import zipfile
 from datetime import datetime, timezone as dt_timezone
 
@@ -11,9 +10,8 @@ from tortoise import Tortoise, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from models import SEASONS, GameState, GoldTransaction, MarketEvent, Player, Order, TurnMap
 from cogs import economy, maps, market
+import templates
 from formatting import DISCORD_MESSAGE_LIMIT, chunk_blocks, format_order, page_slice
-
-SERVER_TIPS_PATH = os.path.join(os.path.dirname(__file__), "..", "content", "server_tips.md")
 
 log = logging.getLogger(__name__)
 setup_log = log.getChild("setup")
@@ -149,13 +147,7 @@ class GMCog(commands.Cog):
         )
 
         try:
-            await user.send(
-                f"*A distinguished cat in a top hat slides a sealed envelope across the table.*\n\n"
-                f"Welcome to the game, **{faction}**. Your private channels have been prepared on the server.\n\n"
-                f"— `#{safe_name}-diplomacy` is for correspondence with the GM.\n"
-                f"— `#{safe_name}-commands` is where you submit your moves to me.\n\n"
-                f"*The cat diplomat tucks a paw into their waistcoat and vanishes.*"
-            )
+            await user.send(templates.render("welcome.md", faction=faction, safe_name=safe_name))
         except discord.Forbidden:
             pass  # Player has DMs disabled — not a blocker
 
@@ -468,8 +460,7 @@ class GMCog(commands.Cog):
 
     async def _post_server_tips(self, channel: discord.TextChannel):
         try:
-            with open(SERVER_TIPS_PATH, encoding="utf-8") as f:
-                content = f.read().strip()
+            content = templates.render("server_tips.md")
         except OSError as e:
             setup_log.warning(f"Could not read server tips file: {e}")
             return

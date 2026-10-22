@@ -593,29 +593,56 @@ class SendGoldModal(discord.ui.DesignerModal):
         )
 
 
-async def _notify_recipient(bot: discord.Client, recipient: Player, sender: Player, tx: GoldTransaction):
+def diplomacy_channel(guild: discord.Guild, player: Player) -> discord.TextChannel | None:
+    """The player's private #<faction>-diplomacy channel, or None if it can't be found.
+    Mirrors the naming in GMCog.add_player; the category lookup covers names Discord
+    normalised differently."""
+    name = f"{player.faction_name.lower().replace(' ', '-')}-diplomacy"
+    channel = discord.utils.get(guild.text_channels, name=name)
+    if channel:
+        return channel
+    category = discord.utils.get(guild.categories, name=f"🐱 {player.faction_name}")
+    if category:
+        return next((c for c in category.text_channels if c.name.endswith("-diplomacy")), None)
+    return None
+
+
+async def notify_player(bot: discord.Client, player: Player, text: str):
+    """Post a notice to the player's -diplomacy channel, @-mentioning them so they're
+    alerted. Falls back to a DM only if the channel is missing or the post fails."""
+    guild = bot.get_guild(player.guild_id)
+    channel = diplomacy_channel(guild, player) if guild else None
+    if channel:
+        try:
+            await channel.send(f"<@{player.user_id}>\n{text}")
+            return
+        except discord.HTTPException as e:
+            log.warning(f"Could not post notice to {player.faction_name}'s diplomacy channel: {e}")
     try:
-        user = await bot.fetch_user(recipient.user_id)
-        await user.send(
-            f"*A cat courier drops a jingling pouch at your paws.*\n\n"
-            f"**{sender.faction_name}** has sent you **{tx.amount} gold**{_note(tx)}.\n"
-            f"Your treasury now holds **{tx.to_balance_after} gold**."
-        )
+        user = await bot.fetch_user(player.user_id)
+        await user.send(text)
     except (discord.Forbidden, discord.NotFound):
         pass
+
+
+async def _notify_recipient(bot: discord.Client, recipient: Player, sender: Player, tx: GoldTransaction):
+    await notify_player(
+        bot, recipient,
+        f"*A cat courier drops a jingling pouch at your paws.*\n\n"
+        f"**{sender.faction_name}** has sent you **{tx.amount} gold**{_note(tx)}.\n"
+        f"Your treasury now holds **{tx.to_balance_after} gold**.",
+    )
 
 
 async def _notify_adjustment(bot: discord.Client, player: Player, tx: GoldTransaction):
-    try:
-        user = await bot.fetch_user(player.user_id)
-        direction = "added" if tx.transaction_type == "GM_GRANT" else "taken"
-        await user.send(
-            f"*A telegram arrives, sealed with the mark of the cat diplomat.*\n\n"
-            f"**{tx.amount} gold {direction}** — {tx.reason}\n"
-            f"Your new balance: **{tx.to_balance_after if tx.transaction_type == 'GM_GRANT' else tx.from_balance_after} gold**"
-        )
-    except (discord.Forbidden, discord.NotFound):
-        pass
+    direction = "added" if tx.transaction_type == "GM_GRANT" else "taken"
+    new_balance = tx.to_balance_after if tx.transaction_type == "GM_GRANT" else tx.from_balance_after
+    await notify_player(
+        bot, player,
+        f"*A telegram arrives, sealed with the mark of the cat diplomat.*\n\n"
+        f"**{tx.amount} gold {direction}** — {tx.reason}\n"
+        f"Your new balance: **{new_balance} gold**",
+    )
 
 
 class GoldView(discord.ui.View):

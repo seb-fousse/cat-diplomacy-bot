@@ -133,18 +133,6 @@ async def refresh_open_posts(bot: discord.Bot, guild_id: int) -> int:
 # Settlement notices — posted in each bettor's private -diplomacy channel
 # ---------------------------------------------------------------------------
 
-def _diplomacy_channel(guild: discord.Guild, player: Player) -> discord.TextChannel | None:
-    # Mirrors the naming in GMCog.add_player; the category lookup covers names Discord normalised differently
-    name = f"{player.faction_name.lower().replace(' ', '-')}-diplomacy"
-    channel = discord.utils.get(guild.text_channels, name=name)
-    if channel:
-        return channel
-    category = discord.utils.get(guild.categories, name=f"🐱 {player.faction_name}")
-    if category:
-        return next((c for c in category.text_channels if c.name.endswith("-diplomacy")), None)
-    return None
-
-
 def _notice_for(event: MarketEvent, positions: list[MarketPosition], balance: int) -> str:
     staked = sum(p.amount for p in positions)
     received = sum(p.payout or 0 for p in positions)
@@ -177,7 +165,7 @@ async def notify_bettors(bot: discord.Bot, event: MarketEvent):
     for player_positions in by_player.values():
         player = player_positions[0].player
         text = f"<@{player.user_id}>\n" + _notice_for(event, player_positions, player.gold_balance)
-        channel = _diplomacy_channel(guild, player) if guild else None
+        channel = economy.diplomacy_channel(guild, player) if guild else None
         try:
             if channel:
                 await channel.send(text)
