@@ -1,0 +1,21 @@
+#!/bin/sh
+# Refuse a commit that would leave the bot asking for copy that doesn't exist, or
+# passing fields a template doesn't expect. Enable once per clone with:
+#   git config core.hooksPath .githooks
+# Skip in an emergency with: git commit --no-verify
+
+root="$(git rev-parse --show-toplevel)" || exit 1
+
+if [ -x "$root/.venv/bin/python" ]; then
+    python="$root/.venv/bin/python"
+else
+    python=python3
+fi
+
+# Check the commit as staged, not the working tree, so unstaged edits can neither
+# hide a problem nor block a commit that is fine
+snapshot="$(mktemp -d)" || exit 1
+trap 'rm -rf "$snapshot"' EXIT
+git checkout-index --all --prefix="$snapshot/" || exit 1
+
+"$python" -I "$snapshot/scripts/check_copy.py"

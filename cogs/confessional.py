@@ -8,6 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from discord.ext import commands
 from models import ConfessionalLog, Player
+import templates
 
 # Delayed posts have to survive a bot restart, so pending attachments are saved
 # to disk (rather than trusting the Discord CDN URL to still be valid whenever
@@ -127,10 +128,7 @@ class ConfessionalCog(commands.Cog):
         # The post itself carries no author, and the command's reply is ephemeral.
         confessional_channel = discord.utils.get(ctx.guild.text_channels, name="confessional")
         if not confessional_channel:
-            await ctx.respond(
-                "❌ Could not find the `#confessional` channel. Ask your GM to check the server setup.",
-                ephemeral=True,
-            )
+            await ctx.respond(templates.text("confessional.channel_missing"), ephemeral=True)
             return
 
         await ctx.send_modal(ConfessionalModal(self))
@@ -144,31 +142,26 @@ class ConfessionalCog(commands.Cog):
     ):
         message = (raw_message or "").strip() or None
         if not message and not attachment:
-            await interaction.response.send_message(
-                "⚠️ Please provide a message, an image, or a voice note to post.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(templates.text("confessional.empty"), ephemeral=True)
             return
 
         raw_delay = (raw_delay or "0").strip()
         if not raw_delay.isdigit():
-            await interaction.response.send_message(f"❌ `{raw_delay}` isn't a valid number of minutes.", ephemeral=True)
+            await interaction.response.send_message(
+                templates.text("confessional.invalid_delay", delay=raw_delay), ephemeral=True
+            )
             return
 
         delay_minutes = int(raw_delay)
         if delay_minutes > MAX_DELAY_MINUTES:
             await interaction.response.send_message(
-                f"❌ Delay must be between 0 and {MAX_DELAY_MINUTES} minutes.",
-                ephemeral=True,
+                templates.text("confessional.delay_too_long", max=MAX_DELAY_MINUTES), ephemeral=True
             )
             return
 
         confessional_channel = discord.utils.get(interaction.guild.text_channels, name="confessional")
         if not confessional_channel:
-            await interaction.response.send_message(
-                "❌ Could not find the `#confessional` channel. Ask your GM to check the server setup.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(templates.text("confessional.channel_missing"), ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -183,7 +176,7 @@ class ConfessionalCog(commands.Cog):
                 try:
                     file = await attachment.to_file()
                 except Exception:
-                    await interaction.followup.send("❌ Failed to read the attachment. Please try again.", ephemeral=True)
+                    await interaction.followup.send(templates.text("confessional.read_failed"), ephemeral=True)
                     return
 
             await confessional_channel.send(content=message, file=file)
@@ -195,7 +188,7 @@ class ConfessionalCog(commands.Cog):
                 attachment_url=attachment.url if attachment else None,
                 status="posted",
             )
-            await interaction.followup.send("✅ Your message has been posted to the confessional.", ephemeral=True)
+            await interaction.followup.send(templates.text("confessional.posted"), ephemeral=True)
             return
 
         # Delayed post: log as pending, save the attachment to disk, and schedule the job.
@@ -213,7 +206,7 @@ class ConfessionalCog(commands.Cog):
             try:
                 await attachment.save(path)
             except Exception:
-                await interaction.followup.send("❌ Failed to save the attachment. Please try again.", ephemeral=True)
+                await interaction.followup.send(templates.text("confessional.save_failed"), ephemeral=True)
                 await log.delete()
                 return
             log.attachment_path = str(path)
@@ -224,8 +217,7 @@ class ConfessionalCog(commands.Cog):
 
         minute_word = "minute" if delay_minutes == 1 else "minutes"
         await interaction.followup.send(
-            f"✅ Your message will be posted to the confessional in **{delay_minutes} {minute_word}**.",
-            ephemeral=True,
+            templates.text("confessional.scheduled", minutes=delay_minutes, unit=minute_word), ephemeral=True
         )
 
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from discord.ext import commands
 from cogs import maps
+import templates
 from models import GameState, Order as OrderRecord, Player, TurnMap
 from discord.ui.input_text import InputText as _InputText
 from discord.ui.label import Label as _Label
@@ -72,9 +73,9 @@ def _deadline_line(game_state: GameState | None) -> str:
     """Line describing when the GM intends to close submissions, or the closed/unset state.
     Closing is a manual GM action, so the schedule is an intention, not a hard cut-off."""
     if game_state is None:
-        return "⚠️ *The GM hasn't set the current turn yet.*"
+        return templates.text("orders.deadline_not_set")
     if game_state.turn_status == "closed":
-        return "🔒 **Submissions are closed for this turn.** Wait for the GM to advance to the next turn."
+        return templates.text("orders.deadline_closed")
     if not game_state.close_weekdays or game_state.close_hour is None:
         return ""
 
@@ -88,7 +89,7 @@ def _deadline_line(game_state: GameState | None) -> str:
     if not next_close:
         return ""
     epoch = int(next_close.timestamp())
-    return f"⏰ The GM plans to close orders <t:{epoch}:R> (<t:{epoch}:F>)."
+    return templates.text("orders.deadline_planned", epoch=epoch)
 
 
 def _orders_message(
@@ -101,22 +102,18 @@ def _orders_message(
     season: str | None = None,
 ) -> str:
     if shown_map is None:
-        caption = "🗺️ *No map posted yet.*\n\n"
+        caption = templates.text("orders.no_map") + "\n\n"
     elif map_shown:
-        caption = f"🗺️ *Map — {maps.map_label(shown_map)}*\n\n"
+        caption = templates.text("orders.map_caption", map=maps.map_label(shown_map)) + "\n\n"
     else:
-        caption = f"🗺️ *Map — {maps.map_label(shown_map)} (image unavailable)*\n\n"
+        caption = templates.text("orders.map_unavailable", map=maps.map_label(shown_map)) + "\n\n"
     if is_winter(season):
-        caption += "❄️ *Winter adjustments — add or remove units.*\n\n"
+        caption += templates.text("orders.winter") + "\n\n"
     header = f"{caption}{notice}\n\n" if notice else caption
     deadline = f"{deadline_line}\n\n" if deadline_line else ""
-    status = (
-        "💾 *Saved automatically.*"
-        if orders == saved
-        else "⚠️ **Not saved** — your latest change could not be stored. See the message above."
-    )
+    status = templates.text("orders.saved" if orders == saved else "orders.not_saved")
     if not orders:
-        return f"{header}{deadline}*No orders yet.*\nUse **Add Order** to begin building your turn.\n\n{status}"
+        return f"{header}{deadline}{templates.text('orders.empty')}\n\n{status}"
     body = "\n".join(f"{i}. {order}" for i, order in enumerate(orders, 1))
     return f"{header}{deadline}```\n{body}\n```\n{status}"
 
@@ -169,7 +166,7 @@ class AddOrderModal(discord.ui.DesignerModal):
         self.cog.pending_orders.setdefault(self.user_id, []).append(order)
 
         await self.cog.autosave_and_render(
-            interaction, self.user_id, f"✅ **Added and saved:** {order}"
+            interaction, self.user_id, templates.text("orders.added", order=order)
         )
 
 
@@ -198,15 +195,13 @@ class OrdersActions(discord.ui.ActionRow):
         if orders:
             removed = orders.pop()
             log.info(f"Removed order for user {self.user_id}: {removed}")
-            notice = f"↩️ **Removed and saved:** {removed}"
+            notice = templates.text("orders.removed", order=removed)
         await self.cog.autosave_and_render(interaction, self.user_id, notice)
 
     @discord.ui.button(label="Clear All", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def clear_all(self, button: discord.ui.Button, interaction: discord.Interaction):
         self.cog.pending_orders[self.user_id] = []
-        await self.cog.autosave_and_render(
-            interaction, self.user_id, "🗑️ **All orders cleared.** You have no orders saved for this turn."
-        )
+        await self.cog.autosave_and_render(interaction, self.user_id, templates.text("orders.cleared"))
 
 
 class OrdersView(discord.ui.DesignerView):
@@ -271,38 +266,22 @@ class OrdersCog(commands.Cog):
         game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
         if not game_state:
             self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
-            await self.render(
-                interaction,
-                user_id,
-                "⚠️ The GM hasn't set the current turn yet, so your change wasn't saved. Ask them to run `/gm turn`.",
-            )
+            await self.render(interaction, user_id, templates.text("orders.not_saved_no_turn"))
             return
         if game_state.turn_status == "closed":
             self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
-            await self.render(
-                interaction,
-                user_id,
-                "⚠️ Submissions are closed for this turn, so your change wasn't saved. Wait for the GM to advance to the next turn.",
-            )
+            await self.render(interaction, user_id, templates.text("orders.not_saved_closed"))
             return
 
         player = await Player.get_or_none(guild_id=interaction.guild.id, user_id=interaction.user.id)
         if player and player.is_eliminated:
             self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
-            await self.render(
-                interaction,
-                user_id,
-                "⚠️ You have been eliminated and can no longer submit orders.",
-            )
+            await self.render(interaction, user_id, templates.text("orders.eliminated"))
             return
         if not player:
             log.warning(f"No DB record for user {interaction.user.id} — orders not persisted")
             self.pending_orders[user_id] = list(self.saved_orders.get(user_id, []))
-            await self.render(
-                interaction,
-                user_id,
-                "⚠️ You're not registered as a player — your change wasn't saved. Ask the GM.",
-            )
+            await self.render(interaction, user_id, templates.text("orders.not_saved_unregistered"))
             return
 
         faction = interaction.channel.category.name.removeprefix("🐱 ")
@@ -337,18 +316,16 @@ class OrdersCog(commands.Cog):
     @discord.slash_command(name="orders", description="Open the orders builder for this turn")
     async def orders(self, ctx: discord.ApplicationContext):
         if discord.utils.get(ctx.author.roles, name="GM"):
-            await ctx.respond("⚠️ Only active players can submit orders.", ephemeral=True)
+            await ctx.respond(templates.text("orders.not_player"), ephemeral=True)
             return
 
         if not discord.utils.get(ctx.author.roles, name="Player"):
-            await ctx.respond("⚠️ Only active players can submit orders.", ephemeral=True)
+            await ctx.respond(templates.text("orders.not_player"), ephemeral=True)
             return
 
         player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
         if player and player.is_eliminated:
-            await ctx.respond(
-                "⚠️ You have been eliminated and can no longer submit orders.", ephemeral=True
-            )
+            await ctx.respond(templates.text("orders.eliminated"), ephemeral=True)
             return
 
         channel = ctx.channel
@@ -359,10 +336,7 @@ class OrdersCog(commands.Cog):
             and category.name.startswith("🐱 ")
             and channel.name.endswith("-commands")
         ):
-            await ctx.respond(
-                "⚠️ This command can only be used in your private orders channel.",
-                ephemeral=True,
-            )
+            await ctx.respond(templates.text("orders.wrong_channel"), ephemeral=True)
             return
 
         # A map that isn't in #map yet is uploaded first, which can outlast Discord's 3s window

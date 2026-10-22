@@ -14,6 +14,7 @@ from tortoise.transactions import in_transaction
 from models import BalanceSnapshot, GameState, GoldTransaction, MarketEvent, MarketPosition, Player
 import cogs.orders  # noqa: F401 — applies the pycord patch that makes optional modal inputs work
 from formatting import DISCORD_MESSAGE_LIMIT, page_label, page_slice, truncate
+import templates
 
 log = logging.getLogger(__name__)
 
@@ -351,7 +352,7 @@ def transactions_table(
     """Passing `tz` adds a leftmost timestamp column rendered in that zone. Only the GM's
     ledger does; a player's own panel stays as it was."""
     if not txs:
-        return "*No transactions yet.*"
+        return templates.text("gold.no_transactions")
     rows = []
     for tx in txs:
         outgoing = tx.from_player_id == viewer.id
@@ -510,12 +511,12 @@ def _snapshots_csv(snapshots: list[BalanceSnapshot]) -> discord.File:
 
 async def _balance_lines(player: Player) -> str:
     locked = (await locked_gold(player.guild_id))[player.id]
-    in_markets = f"\n🎲 balance locked up in markets - **{locked} gold**" if locked else ""
-    return f"💰 balance: **{player.gold_balance} gold**{in_markets}"
+    in_markets = "\n" + templates.text("gold.balance_locked", locked=locked) if locked else ""
+    return templates.text("gold.balance", balance=player.gold_balance) + in_markets
 
 
 async def _balance_message(player: Player, notice: str = "") -> str:
-    frozen = "\n*Your treasury is frozen — you have been eliminated.*" if player.is_eliminated else ""
+    frozen = "\n" + templates.text("gold.frozen") if player.is_eliminated else ""
     header = f"{notice}\n\n" if notice else ""
     return f"{header}{await _balance_lines(player)}{frozen}"
 
@@ -523,7 +524,7 @@ async def _balance_message(player: Player, notice: str = "") -> str:
 async def history_panel(player: Player, page: int = 0) -> tuple[str, "GoldView"]:
     """The player's own transaction page, with the matching button state."""
     rows, page, total_pages = page_slice(await player_history(player), page, HISTORY_PAGE_SIZE)
-    heading = f"📒 **Transactions**{page_label(page, total_pages)}"
+    heading = templates.text("gold.transactions_heading") + page_label(page, total_pages)
     content = f"{heading}\n{await _balance_lines(player)}\n{transactions_table(rows, player)}"
     return content, GoldView(player, history=True, page=page, total_pages=total_pages)
 
@@ -563,7 +564,7 @@ class SendGoldModal(discord.ui.DesignerModal):
     async def callback(self, interaction: discord.Interaction):
         raw_amount = self.amount_label.item.value.strip()
         if not raw_amount.isdigit() or int(raw_amount) <= 0:
-            await interaction.response.send_message(f"❌ `{raw_amount}` isn't a valid amount of gold.", ephemeral=True)
+            await interaction.response.send_message(templates.text("gold.invalid_amount", amount=raw_amount), ephemeral=True)
             return
         amount = int(raw_amount)
         note = (self.note_label.item.value or "").strip() or None
@@ -571,16 +572,18 @@ class SendGoldModal(discord.ui.DesignerModal):
         sender = await Player.get(id=self.sender_id)
         recipient = await Player.get_or_none(id=int(self.recipient_label.item.values[0]))
         if sender.is_eliminated:
-            await interaction.response.send_message("⚠️ Eliminated players can't send gold.", ephemeral=True)
+            await interaction.response.send_message(templates.text("gold.eliminated_cannot_send"), ephemeral=True)
             return
         if not recipient or recipient.is_eliminated:
-            await interaction.response.send_message("⚠️ That faction is no longer in the game.", ephemeral=True)
+            await interaction.response.send_message(templates.text("gold.recipient_gone"), ephemeral=True)
             return
 
         try:
             tx = await transfer(sender, recipient, amount, note, initiated_by=interaction.user.id)
         except EconomyError as e:
-            await interaction.response.send_message(f"❌ {e} You have **{sender.gold_balance} gold**.", ephemeral=True)
+            await interaction.response.send_message(
+                templates.text("gold.send_failed", error=e, balance=sender.gold_balance), ephemeral=True
+            )
             return
 
         log.info(f"{sender.faction_name} → {recipient.faction_name}: {amount} (tx {tx.id})")
@@ -588,7 +591,9 @@ class SendGoldModal(discord.ui.DesignerModal):
 
         await sender.refresh_from_db()
         await interaction.response.edit_message(
-            content=await _balance_message(sender, f"✅ Sent **{amount} gold** to **{recipient.faction_name}**."),
+            content=await _balance_message(
+                sender, templates.text("gold.sent", amount=amount, recipient=recipient.faction_name)
+            ),
             view=GoldView(sender),
         )
 
@@ -628,9 +633,10 @@ async def notify_player(bot: discord.Client, player: Player, text: str):
 async def _notify_recipient(bot: discord.Client, recipient: Player, sender: Player, tx: GoldTransaction):
     await notify_player(
         bot, recipient,
-        f"*A cat courier drops a jingling pouch at your paws.*\n\n"
-        f"**{sender.faction_name}** has sent you **{tx.amount} gold**{_note(tx)}.\n"
-        f"Your treasury now holds **{tx.to_balance_after} gold**.",
+        templates.render(
+            "gold_received.md",
+            sender=sender.faction_name, amount=tx.amount, note=_note(tx), balance=tx.to_balance_after,
+        ),
     )
 
 
@@ -639,9 +645,9 @@ async def _notify_adjustment(bot: discord.Client, player: Player, tx: GoldTransa
     new_balance = tx.to_balance_after if tx.transaction_type == "GM_GRANT" else tx.from_balance_after
     await notify_player(
         bot, player,
-        f"*A telegram arrives, sealed with the mark of the cat diplomat.*\n\n"
-        f"**{tx.amount} gold {direction}** — {tx.reason}\n"
-        f"Your new balance: **{new_balance} gold**",
+        templates.render(
+            "gold_adjusted.md", amount=tx.amount, direction=direction, reason=tx.reason, balance=new_balance
+        ),
     )
 
 
@@ -676,13 +682,13 @@ class GoldView(discord.ui.View):
     async def send_gold(self, button: discord.ui.Button, interaction: discord.Interaction):
         player = await self._player()
         if player.gold_balance <= 0:
-            await interaction.response.send_message("⚠️ Your treasury is empty.", ephemeral=True)
+            await interaction.response.send_message(templates.text("gold.treasury_empty"), ephemeral=True)
             return
         recipients = await Player.filter(
             guild_id=player.guild_id, is_eliminated=False
         ).exclude(id=player.id).order_by("faction_name").limit(25)
         if not recipients:
-            await interaction.response.send_message("⚠️ There's no one to send gold to.", ephemeral=True)
+            await interaction.response.send_message(templates.text("gold.no_recipients"), ephemeral=True)
             return
         await interaction.response.send_modal(SendGoldModal(player, recipients))
 
@@ -907,12 +913,12 @@ class EconomyCog(commands.Cog):
     @discord.slash_command(name="gold", description="Open your faction's treasury")
     async def gold(self, ctx: discord.ApplicationContext):
         if discord.utils.get(ctx.author.roles, name="GM"):
-            await ctx.respond("⚠️ Only players have a treasury.", ephemeral=True)
+            await ctx.respond(templates.text("gold.not_player"), ephemeral=True)
             return
 
         player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
         if not player:
-            await ctx.respond("⚠️ Only players have a treasury.", ephemeral=True)
+            await ctx.respond(templates.text("gold.not_player"), ephemeral=True)
             return
         await ctx.respond(content=await _balance_message(player), view=GoldView(player), ephemeral=True)
 

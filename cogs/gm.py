@@ -235,12 +235,7 @@ class GMCog(commands.Cog):
             return
 
         try:
-            await diplomacy_channel.send(
-                f"*A solemn telegram arrives, sealed with the mark of the cat diplomat.*\n\n"
-                f"**{player.faction_name}** has been eliminated from the game.\n\n"
-                f"Your channels remain accessible for record-keeping, but you may no longer submit orders or take actions.\n\n"
-                f"*The cat diplomat removes their top hat in respectful silence.*"
-            )
+            await diplomacy_channel.send(templates.render("elimination.md", faction=player.faction_name))
         except discord.HTTPException as e:
             log.warning(f"Could not send elimination notification to {diplomacy_channel.name}: {e}")
 
@@ -505,7 +500,7 @@ async def _post_turn_started(guild: discord.Guild, season: str, year: int):
     game_log = discord.utils.get(guild.text_channels, name="game-log")
     if game_log:
         try:
-            await game_log.send(f"🗓️ **{season} {year}** has begun. Orders are now open.")
+            await game_log.send(templates.text("turns.started", season=season, year=year))
         except Exception as e:
             turn_log.exception("Failed to post turn-start to game-log")
 

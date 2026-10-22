@@ -32,6 +32,12 @@ A Discord bot for running a cat-themed version of the board game [Diplomacy](htt
 
 4. In Discord, run `/gm manage` and press **Setup Server** to initialise the server. This creates a `GM` role and assigns it to you.
 
+5. If you'll be committing changes, enable the pre-commit hook once per clone:
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+   It runs `scripts/check_copy.py`, which blocks a commit when the code asks for message copy that `content/` doesn't have, or passes fields a template doesn't expect.
+
 ## Adding another GM
 
 GM access is controlled entirely by Discord's built-in `GM` role, so anyone with it can run GM commands — but Discord hides slash commands from a role by default until you explicitly allow them, so two steps are needed:

@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import discord
 from discord.ext import commands
 from models import SEASONS, TurnMap
+import templates
 
 # Each turn's map is kept on disk as the master copy: Discord CDN links expire and posts
 # can be deleted, and a missing post is simply made again from here.
@@ -18,11 +19,6 @@ MAP_DIR = Path(__file__).resolve().parent.parent / "data" / "maps"
 # order, the bottom one carrying a History button too. Its posts are also the images
 # /orders and History show, by link, so no panel ever re-uploads a file.
 MAP_CHANNEL = "map"
-MAP_TOPIC = "Every turn's map, in order. Press History on the pinned message to browse them."
-MAP_INTRO = (
-    "📜 **Maps** — every turn's map is posted here as the game goes, starting map first.\n"
-    "Press **History** to step through them."
-)
 REFERENCE_CATEGORY = "📚 Reference"
 LINK_MARGIN_SECONDS = 3600        # refresh a link this long before Discord expires it
 FALLBACK_LINK_SECONDS = 2 * 3600  # assumed lifetime for a link that doesn't carry its expiry
@@ -41,8 +37,8 @@ def map_label(turn_map: TurnMap) -> str:
 
 def _caption(turn_map: TurnMap) -> str:
     if turn_map.is_starting:
-        return f"🗺️ **Starting Map — {map_label(turn_map)}**"
-    return f"🗺️ **{map_label(turn_map)}**"
+        return templates.text("maps.starting_caption", map=map_label(turn_map))
+    return templates.text("maps.caption", map=map_label(turn_map))
 
 
 def check_map_upload(guild: discord.Guild, attachment: discord.Attachment | None) -> str:
@@ -151,18 +147,19 @@ async def create_map_channel(
     History button so it sits above every map."""
     log.info(f"Creating #{MAP_CHANNEL} in guild {guild.id}")
     category = category or discord.utils.get(guild.categories, name=REFERENCE_CATEGORY)
+    topic = templates.text("maps.topic")
     if category:
         # No overwrites of its own, so it follows the category's
-        channel = await guild.create_text_channel(MAP_CHANNEL, category=category, topic=MAP_TOPIC)
+        channel = await guild.create_text_channel(MAP_CHANNEL, category=category, topic=topic)
     else:
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
         }
-        channel = await guild.create_text_channel(MAP_CHANNEL, overwrites=overwrites, topic=MAP_TOPIC)
+        channel = await guild.create_text_channel(MAP_CHANNEL, overwrites=overwrites, topic=topic)
 
     try:
-        intro = await channel.send(MAP_INTRO, view=HistoryButtonView())
+        intro = await channel.send(templates.text("maps.intro"), view=HistoryButtonView())
         await intro.pin(reason="History button for the maps")
     except discord.HTTPException as e:
         # The maps still post and show in panels; only the pinned shortcut is missing
@@ -317,7 +314,7 @@ class HistoryButtonView(discord.ui.View):
         await interaction.response.defer()
         view = await history_panel(interaction.guild)
         if view is None:
-            await interaction.followup.send("🗺️ No maps posted yet.", ephemeral=True)
+            await interaction.followup.send(templates.text("maps.no_maps"), ephemeral=True)
             return
         await interaction.followup.send(view=view, ephemeral=True)
 
@@ -378,13 +375,13 @@ class MapHistoryView(discord.ui.DesignerView):
     def __init__(self, turn_maps: list[TurnMap], index: int, url: str | None):
         super().__init__(timeout=None)
         turn_map = turn_maps[index]
-        self.add_item(discord.ui.TextDisplay(f"Viewing Map - {map_label(turn_map)}"))
+        self.add_item(discord.ui.TextDisplay(templates.text("maps.viewing", map=map_label(turn_map))))
         if url:
             self.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(
                 url, description=f"Map — {map_label(turn_map)}"
             )))
         else:
-            self.add_item(discord.ui.TextDisplay("*Image unavailable.*"))
+            self.add_item(discord.ui.TextDisplay(templates.text("maps.image_unavailable")))
         self.add_item(MapHistoryNav(turn_maps, index))
 
 
@@ -393,7 +390,7 @@ class MapHistoryGone(discord.ui.DesignerView):
 
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(discord.ui.TextDisplay("🗺️ No maps posted yet."))
+        self.add_item(discord.ui.TextDisplay(templates.text("maps.no_maps")))
 
 
 class MapsCog(commands.Cog):

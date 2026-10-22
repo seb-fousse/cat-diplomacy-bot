@@ -10,6 +10,7 @@ from tortoise import timezone
 from models import GameState, Player, Order
 from cogs import economy
 from formatting import chunk_blocks, format_order
+import templates
 
 log = logging.getLogger(__name__)
 
@@ -28,10 +29,9 @@ def _public_orders_messages(state: GameState, orders: list[Order]) -> list[str]:
     """The turn's orders as one or more messages. Each faction's block is kept whole where
     it fits, since Discord refuses any single message over 2000 characters and a long turn
     would otherwise drop the whole public record."""
-    rule = "═══════════════════════════════════"
-    header = f"{rule}\n**{state.season} {state.year} — Orders**\n{rule}"
+    header = templates.text("turns.public_orders_header", season=state.season, year=state.year)
     if not orders:
-        return [f"{header}\n\n*No orders submitted this turn.*"]
+        return [f"{header}\n\n{templates.text('turns.public_orders_empty')}"]
 
     faction_orders: dict[str, list[Order]] = {}
     for o in orders:
@@ -174,10 +174,7 @@ class TurnManagerCog(commands.Cog):
         for player in no_order_players:
             try:
                 user = await self.bot.fetch_user(player.user_id)
-                await user.send(
-                    f"⚠️ Orders are now closed for **{state.season} {state.year}**. "
-                    f"You did not submit any orders this turn."
-                )
+                await user.send(templates.render("orders_missed.md", season=state.season, year=state.year))
             except Exception as e:
                 log.warning(f"Failed to DM user {player.user_id}: {e}")
 
@@ -185,7 +182,7 @@ class TurnManagerCog(commands.Cog):
         game_log = discord.utils.get(guild.text_channels, name="game-log")
         if game_log:
             try:
-                await game_log.send(f"🔒 Orders closed for **{state.season} {state.year}**.")
+                await game_log.send(templates.text("turns.closed", season=state.season, year=state.year))
             except Exception as e:
                 log.exception("Failed to post to game-log")
 
@@ -253,11 +250,11 @@ class TurnManagerCog(commands.Cog):
         if town_square:
             try:
                 time_str = f"{state.close_hour:02d}:{state.close_minute:02d}"
-                await town_square.send(
-                    f"@everyone ⏰ The Cat Diplomat plans to close orders for "
-                    f"**{state.season} {state.year}** in about **1 hour**, at "
-                    f"**{time_str} {state.close_timezone}**. Get your orders in!"
+                reminder = templates.render(
+                    "orders_closing_soon.md",
+                    season=state.season, year=state.year, time=time_str, timezone=state.close_timezone,
                 )
+                await town_square.send(f"@everyone {reminder}")
             except Exception as e:
                 log.exception("Failed to post reminder")
 

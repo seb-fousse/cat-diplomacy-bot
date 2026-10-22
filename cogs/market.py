@@ -9,6 +9,7 @@ from models import GameState, GoldTransaction, MarketEvent, MarketPosition, Play
 from cogs import economy
 from cogs.economy import MARKET_SIDES, EconomyError, code_table
 from formatting import truncate
+import templates
 
 log = logging.getLogger(__name__)
 
@@ -67,23 +68,23 @@ def _jump_url(event: MarketEvent) -> str:
 
 def _status_line(event: MarketEvent, total: int, betting_enabled: bool = True) -> str:
     if event.status == "OPEN" and not betting_enabled:
-        return "🚫 *The Cat Diplomat isn't taking bets right now.*"
+        return templates.text("markets.status_paused")
     if event.status == "OPEN":
-        return "*Place your bets below. Bets are anonymous and your gold stays locked until the market is resolved.*"
+        return templates.text("markets.status_open")
     if event.status == "CLOSED":
-        return "🔒 *Betting is closed. Awaiting the Cat Diplomat's ruling.*"
+        return templates.text("markets.status_closed")
     if event.status == "RESOLVED" and not total:
-        return f"🏁 **Resolved: {event.outcome}** — no bets were placed on this market."
+        return templates.text("markets.status_resolved_no_bets", outcome=event.outcome)
     if event.status == "RESOLVED" and event.refunded:
-        return f"🏁 **Resolved: {event.outcome}** — nobody backed {event.outcome}, so every stake has been returned."
+        return templates.text("markets.status_resolved_refunded", outcome=event.outcome)
     if event.status == "RESOLVED":
         loser = "NO" if event.outcome == "YES" else "YES"
-        return f"🏁 **Resolved: {event.outcome}** — {event.outcome} backers split the {loser} pool in proportion to their stakes."
-    return f"🚫 **Cancelled** — {event.cancel_reason}\nEvery stake has been returned."
+        return templates.text("markets.status_resolved", outcome=event.outcome, loser=loser)
+    return templates.text("markets.status_cancelled", reason=event.cancel_reason)
 
 
 async def public_post_content(event: MarketEvent, betting_enabled: bool = True) -> str:
-    lines = [f"🎩 **The Cat Diplomat opens a market** · #{event.id}", f"## {event.question}"]
+    lines = [templates.text("markets.post_header", id=event.id), f"## {event.question}"]
     if event.description:
         lines.append("\n".join(f"> {line}" for line in event.description.splitlines()))
     lines.append("")
@@ -136,22 +137,28 @@ async def refresh_open_posts(bot: discord.Bot, guild_id: int) -> int:
 def _notice_for(event: MarketEvent, positions: list[MarketPosition], balance: int) -> str:
     staked = sum(p.amount for p in positions)
     received = sum(p.payout or 0 for p in positions)
-    lines = [f"🎩 *The Cat Diplomat settles a market:* **{event.question}**"]
+    lines = [templates.text("markets.settled_header", question=event.question)]
 
     if event.status == "CANCELLED":
-        lines.append(f"🚫 The market was cancelled — {event.cancel_reason}")
-        lines.append(f"Your **{staked} gold** has been returned.")
+        lines.append(templates.text("markets.settled_cancelled", reason=event.cancel_reason))
+        lines.append(templates.text("markets.settled_returned", staked=staked))
     elif event.refunded:
-        lines.append(f"🏁 Result: **{event.outcome}** — nobody backed it, so every stake was returned.")
-        lines.append(f"Your **{staked} gold** has been returned.")
+        lines.append(templates.text("markets.settled_refunded", outcome=event.outcome))
+        lines.append(templates.text("markets.settled_returned", staked=staked))
     else:
-        lines.append(f"🏁 Result: **{event.outcome}**")
+        lines.append(templates.text("markets.settled_result", outcome=event.outcome))
         for p in sorted(positions, key=lambda p: p.side, reverse=True):
-            outcome = f"won **{p.payout} gold**" if p.side == event.outcome else "lost"
-            lines.append(f"— {p.amount} gold on {SIDE_EMOJI[p.side]} {p.side} → {outcome}")
-        lines.append(f"Net: **{received - staked:+} gold**.")
+            result = (
+                templates.text("markets.settled_won", payout=p.payout)
+                if p.side == event.outcome
+                else templates.text("markets.settled_lost")
+            )
+            lines.append(templates.text(
+                "markets.settled_position", amount=p.amount, emoji=SIDE_EMOJI[p.side], side=p.side, result=result
+            ))
+        lines.append(templates.text("markets.settled_net", net=f"{received - staked:+}"))
 
-    lines.append(f"Your treasury now holds **{balance} gold**.")
+    lines.append(templates.text("markets.settled_balance", balance=balance))
     return "\n".join(lines)
 
 
@@ -184,15 +191,15 @@ async def _bet_gate(interaction: discord.Interaction, event_id: int) -> tuple[Pl
     player = await Player.get_or_none(guild_id=interaction.guild.id, user_id=interaction.user.id)
     event = await MarketEvent.get_or_none(id=event_id, guild_id=interaction.guild.id)
     if not player:
-        reason = "⚠️ Only players can place bets."
+        reason = templates.text("markets.not_player")
     elif player.is_eliminated:
-        reason = "⚠️ Eliminated players can't place bets."
+        reason = templates.text("markets.eliminated")
     elif not await _markets_enabled(interaction.guild.id):
-        reason = "🚫 Markets are closed — the Cat Diplomat isn't taking bets right now."
+        reason = templates.text("markets.markets_closed")
     elif not event or event.status != "OPEN":
-        reason = "🔒 Betting on this market is closed."
+        reason = templates.text("markets.betting_closed")
     elif player.gold_balance <= 0:
-        reason = "⚠️ Your treasury is empty."
+        reason = templates.text("gold.treasury_empty")
     else:
         return player, event
     await interaction.response.send_message(reason, ephemeral=True)
@@ -218,7 +225,7 @@ class BetModal(discord.ui.DesignerModal):
     async def callback(self, interaction: discord.Interaction):
         raw_amount = self.amount_label.item.value.strip()
         if not raw_amount.isdigit() or int(raw_amount) <= 0:
-            await interaction.response.send_message(f"❌ `{raw_amount}` isn't a valid amount of gold.", ephemeral=True)
+            await interaction.response.send_message(templates.text("gold.invalid_amount", amount=raw_amount), ephemeral=True)
             return
         amount = int(raw_amount)
 
@@ -227,25 +234,21 @@ class BetModal(discord.ui.DesignerModal):
             position = await economy.stake(player, self.event_id, self.side, amount, initiated_by=interaction.user.id)
         except EconomyError as e:
             if str(e) == "Insufficient gold.":
-                msg = f"❌ Insufficient gold — you bet **{amount}** but only have **{player.gold_balance} gold**."
+                msg = templates.text("markets.insufficient_gold", amount=amount, balance=player.gold_balance)
             else:
-                msg = f"❌ {e} You have **{player.gold_balance} gold**."
+                msg = templates.text("markets.bet_failed", error=e, balance=player.gold_balance)
             await interaction.response.send_message(msg, ephemeral=True)
             return
         except Exception:
             log.exception(f"Unexpected error placing bet for {player.faction_name} (market {self.event_id})")
-            await interaction.response.send_message(
-                "❌ Something went wrong placing that bet and your gold wasn't touched. Please try again.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(templates.text("markets.bet_error"), ephemeral=True)
             return
 
         log.info(f"{player.faction_name} bet {amount} on {self.side} (market {self.event_id})")
         await player.refresh_from_db()
-        notice = (
-            f"✅ Bet **{amount} gold** on {SIDE_EMOJI[self.side]} **{self.side}**. "
-            f"Your {self.side} position is now **{position.amount} gold**; your treasury holds **{player.gold_balance} gold**.\n"
-            f"*Your gold is locked until the market is resolved.*"
+        notice = templates.text(
+            "markets.bet_placed", amount=amount, emoji=SIDE_EMOJI[self.side], side=self.side,
+            position=position.amount, balance=player.gold_balance,
         )
         if self.from_panel:
             await interaction.response.edit_message(
@@ -290,23 +293,22 @@ class MarketView(discord.ui.View):
     async def _my_position(self, interaction: discord.Interaction):
         player = await Player.get_or_none(guild_id=interaction.guild.id, user_id=interaction.user.id)
         if not player:
-            await interaction.response.send_message("⚠️ Only players can place bets.", ephemeral=True)
+            await interaction.response.send_message(templates.text("markets.not_player"), ephemeral=True)
             return
         positions = await MarketPosition.filter(event_id=self.event_id, player_id=player.id)
         if not positions:
             await interaction.response.send_message(
-                f"📒 You have no bets on this market. Your treasury holds **{player.gold_balance} gold**.",
-                ephemeral=True,
+                templates.text("markets.position_none", balance=player.gold_balance), ephemeral=True
             )
             return
         pools = await _pools(self.event_id)
-        lines = ["📒 **Your position** *(payouts at current pool sizes — they shift as others bet)*"]
+        lines = [templates.text("markets.position_heading")]
         for p in sorted(positions, key=lambda p: p.side, reverse=True):
-            lines.append(
-                f"{SIDE_EMOJI[p.side]} **{p.side}** — {p.amount} gold staked · "
-                f"if {p.side} wins: ~{_projected_payout(p.amount, p.side, pools)} gold back"
-            )
-        lines.append(f"\nYour treasury holds **{player.gold_balance} gold**.")
+            lines.append(templates.text(
+                "markets.position_line", emoji=SIDE_EMOJI[p.side], side=p.side, amount=p.amount,
+                payout=_projected_payout(p.amount, p.side, pools),
+            ))
+        lines.append("\n" + templates.text("markets.position_balance", balance=player.gold_balance))
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
@@ -332,15 +334,15 @@ async def markets_panel_message(player: Player, selected_id: int | None = None, 
     events = [e for e in events if e.status == "OPEN" or my_positions.get(e.id)]
 
     lines = [
-        f"{header}🎲 **Markets** — you hold **{player.gold_balance} gold**"
-        + (f" · **{locked} gold** locked in markets" if locked else "")
+        header + templates.text("markets.panel_heading", balance=player.gold_balance)
+        + (" " + templates.text("markets.panel_locked", locked=locked) if locked else "")
     ]
     if not events:
-        lines.append("\n*No markets are open right now.*")
+        lines.append("\n" + templates.text("markets.panel_empty"))
     for event in events:
         pools = await _pools(event.id)
         marker = "👉 " if event.id == selected_id else ""
-        state = "betting open" if event.status == "OPEN" else "betting closed — awaiting ruling"
+        state = templates.text("markets.panel_state_open" if event.status == "OPEN" else "markets.panel_state_closed")
         lines.append(
             f"\n{marker}{STATUS_EMOJI[event.status]} **#{event.id} {event.question}** · {state} · "
             f"💰 {sum(pools.values())} gold total · [view post]({_jump_url(event)})"
@@ -352,7 +354,7 @@ async def markets_panel_message(player: Player, selected_id: int | None = None, 
                 f"(~{_projected_payout(p.amount, p.side, pools)} back if {p.side} wins)"
             )
     if player.is_eliminated:
-        lines.append("\n\u26a0\ufe0f **You are eliminated and cannot place new bets.**")
+        lines.append("\n" + templates.text("markets.panel_eliminated"))
 
     # Discord trims trailing blank lines; a zero-width space keeps a gap above the dropdown
     return truncate("\n".join(lines), 1990) + "\n\u200b"
@@ -812,16 +814,16 @@ class MarketCog(commands.Cog):
     @discord.slash_command(name="markets", description="???")
     async def markets(self, ctx: discord.ApplicationContext):
         if discord.utils.get(ctx.author.roles, name="GM"):
-            await ctx.respond("⚠️ Only players can take part in markets.", ephemeral=True)
+            await ctx.respond(templates.text("markets.gate_not_player"), ephemeral=True)
             return
 
         if not await _markets_enabled(ctx.guild.id):
-            await ctx.respond("Meow", ephemeral=True)
+            await ctx.respond(templates.text("markets.gate_disabled"), ephemeral=True)
             return
 
         player = await Player.get_or_none(guild_id=ctx.guild.id, user_id=ctx.author.id)
         if not player:
-            await ctx.respond("⚠️ Only players can take part in markets.", ephemeral=True)
+            await ctx.respond(templates.text("markets.gate_not_player"), ephemeral=True)
             return
         await ctx.respond(
             content=await markets_panel_message(player),
