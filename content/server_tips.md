@@ -5,7 +5,7 @@ Each player gets two private channels, visible only to you and the GMs:
 — `#<faction>-diplomacy` — talk privately with the Intern and the GMs
 — `#<faction>-commands` — submit your orders, manage your gold, and more
 
-**Commands** *(only usable in your `-orders` channel)*
+**Commands** *(only usable in your `-commands` channel)*
 — `/orders` — open the order builder to add and remove moves for the current turn. Press **Save Orders** to lock them in — the panel flags any unsaved changes. You can keep editing and re-saving until orders close; saving an empty list withdraws your orders
 — `/confessional` — post a message, image, or voice note anonymously to `#confessional`
 — `/gold` — open your treasury panel: check your balance, send gold to another player, or review your transaction history

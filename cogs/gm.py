@@ -147,7 +147,7 @@ class GMCog(commands.Cog):
         )
 
         try:
-            await user.send(templates.render("welcome.md", faction=faction, safe_name=safe_name))
+            await user.send(templates.render("welcome.md", player_name=player_name, faction=faction, safe_name=safe_name))
         except discord.Forbidden:
             pass  # Player has DMs disabled — not a blocker
 
