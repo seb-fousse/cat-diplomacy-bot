@@ -35,7 +35,11 @@ def _configure_logging():
 _configure_logging()
 log = logging.getLogger("bot")
 
-bot = discord.Bot(debug_guilds=[int(os.getenv("DEV_GUILD_ID"))])
+# message_content is a privileged intent: it must also be enabled in the Developer Portal
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = discord.Bot(intents=intents, debug_guilds=[int(os.getenv("DEV_GUILD_ID"))])
 
 bot.load_extension("cogs.maps")
 bot.load_extension("cogs.orders")
@@ -44,6 +48,7 @@ bot.load_extension("cogs.market")
 bot.load_extension("cogs.confessional")
 bot.load_extension("cogs.turn_manager")
 bot.load_extension("cogs.gm")
+bot.load_extension("cogs.eight_ball")
 
 
 @bot.event

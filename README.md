@@ -10,6 +10,7 @@ A Discord bot for running a cat-themed version of the board game [Diplomacy](htt
 - **Confessional** — anyone on the server can post anonymously to a public confessional channel from any channel, with text, images, or voice notes, optionally delayed by up to 3 hours
 - **Gold** — each faction has a private treasury; players can secretly send gold to each other, the GM can grant or confiscate it, and every transaction plus per-turn balances are recorded for an end-of-game retrospective
 - **Markets** — the GM posts YES/NO prediction markets to `#town-square`; players anonymously stake gold on either side (or both), stakes stay locked until the GM resolves, and the winning side splits the losing pool in proportion to their stakes
+- **Magic 8 ball** — a message that starts with "Intern" and ends with a question mark, posted in `#town-square` or a faction's diplomacy channel, gets a random answer from the intern after a couple of seconds (not advertised to players in-game; requires the Message Content intent)
 
 ## Setup
 
