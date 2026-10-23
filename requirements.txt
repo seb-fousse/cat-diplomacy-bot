@@ -3,3 +3,4 @@ python-dotenv==1.0.1
 aiosqlite==0.20.0
 tortoise-orm==0.21.7
 apscheduler==3.10.4
+tzdata==2026.5

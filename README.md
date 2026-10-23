@@ -38,6 +38,76 @@ A Discord bot for running a cat-themed version of the board game [Diplomacy](htt
    ```
    It runs `scripts/check_copy.py`, which blocks a commit when the code asks for message copy that `content/` doesn't have, or passes fields a template doesn't expect.
 
+## Deployment
+
+The bot runs as a Docker container on [Fly.io](https://fly.io): one machine, with a 1 GB volume mounted at `/app/data` that holds the database (`DB_PATH=/app/data/cat_game.db`), map images, pending confessional attachments and logs. Only one copy of the bot may ever run, or it will answer everything twice.
+
+### CI/CD
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
+
+- **check** — the copy check, a compile of every module, and an import of every cog
+- **docker** — builds the image and checks it can import its dependencies and resolve timezones
+- **deploy** — on pushes to `main` only, once both pass: `flyctl deploy --ha=false`. The old machine stops before the new one starts, so the bot is offline for a few seconds; scheduled order closes and delayed confessionals are rebuilt from the database on startup
+
+### One-time setup
+
+1. Install [flyctl](https://fly.io/docs/flyctl/install/) and run `fly auth login`.
+2. Create the app (if the name is taken, pick another and update `app` in `fly.toml`; change `primary_region` there too if you like):
+   ```bash
+   fly apps create cat-diplomacy-bot
+   ```
+3. Create the volume in the same region, and set the secrets:
+   ```bash
+   fly volumes create bot_data --size 1 --region iad
+   fly secrets set DISCORD_TOKEN=your_bot_token DEV_GUILD_ID=your_server_id
+   ```
+4. Create a deploy token with `fly tokens create deploy`. In GitHub, go to **Settings → Environments**, create an environment named `production`, and add the token as the secret `FLY_API_TOKEN`. Add yourself as a required reviewer there if you'd rather approve each deploy by hand.
+5. Push to `main` (or run the workflow from the **Actions** tab) to deploy.
+
+### Day to day
+
+| Task | Command |
+|---|---|
+| Watch the logs | `fly logs` |
+| Check the machine is up | `fly status` |
+| Restart the bot | `fly machine restart` |
+| Roll back | `fly releases --image`, then `fly deploy --image <previous image>` |
+| Shell into the container | `fly ssh console` |
+
+### Backups
+
+Fly snapshots the volume daily and keeps 14 days (`fly volumes snapshots list <volume id>`). For a copy on your own machine:
+
+```bash
+fly ssh console -C "python scripts/backup_db.py"
+fly ssh sftp get /app/data/backup.db
+```
+
+`scripts/backup_db.py` uses SQLite's backup API: the database runs in WAL mode, so copying `cat_game.db` on its own can miss recent writes.
+
+### Moving a local game to Fly
+
+Do this before players start using the deployed bot, since it replaces its database:
+
+```bash
+python scripts/backup_db.py export.db          # with the local bot stopped
+fly ssh sftp shell                             # then: put export.db /app/data/import.db
+fly ssh console                                # then the two lines below
+  mv /app/data/import.db /app/data/cat_game.db && rm -f /app/data/cat_game.db-wal /app/data/cat_game.db-shm
+  exit
+fly machine restart
+```
+
+### Running the image locally
+
+```bash
+docker build -t cat-diplomacy-bot .
+docker run --rm --env-file .env -v "$PWD/data:/app/data" cat-diplomacy-bot
+```
+
+Stop the deployed bot first (`fly machine stop`, and `fly machine start` to bring it back) if both would use the same token.
+
 ## Adding another GM
 
 GM access is controlled entirely by Discord's built-in `GM` role, so anyone with it can run GM commands — but Discord hides slash commands from a role by default until you explicitly allow them, so two steps are needed:

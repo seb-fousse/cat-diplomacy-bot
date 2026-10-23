@@ -1,0 +1,22 @@
+# Secrets and local game state stay out of the image; production state lives on the volume
+.env
+.env.*
+data/
+*.db
+*.db-shm
+*.db-wal
+
+.git/
+.github/
+.githooks/
+.claude/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.vscode/
+.idea/
+Dockerfile
+.dockerignore
+fly.toml

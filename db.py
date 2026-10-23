@@ -1,15 +1,17 @@
 import logging
+import os
 
 from tortoise import Tortoise
 
 log = logging.getLogger(__name__)
 
-DB_URL = "sqlite://cat_game.db"
-
 
 async def init_db():
+    # Read here rather than at import, since bot.py imports this before loading .env. The
+    # container sets it so the database lives on the persistent volume.
+    db_path = os.getenv("DB_PATH", "cat_game.db")
     await Tortoise.init(
-        db_url=DB_URL,
+        db_url=f"sqlite://{db_path}",
         modules={"models": ["models"]},
     )
     await Tortoise.generate_schemas()

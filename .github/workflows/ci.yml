@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+      # The same check as the pre-commit hook, for commits made without it
+      - run: python scripts/check_copy.py
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q bot.py db.py models.py formatting.py templates.py cogs scripts
+      # Catches a missing or broken dependency before it reaches the server
+      - name: Import every cog
+        run: |
+          python -c "
+          import importlib, pkgutil, cogs
+          for m in pkgutil.iter_modules(cogs.__path__):
+              importlib.import_module(f'cogs.{m.name}')
+          "
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: cat-diplomacy-bot:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the image
+        run: |
+          docker run --rm cat-diplomacy-bot:ci python -c "
+          import discord, tortoise, apscheduler
+          from zoneinfo import ZoneInfo
+          ZoneInfo('America/New_York')
+          "
+
+  deploy:
+    needs: [check, docker]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    # Never cancel a deploy halfway; queue the next one behind it instead
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: superfly/flyctl-actions/setup-flyctl@1.5
+      # --ha=false keeps it to one machine: a second copy of the bot would answer everything twice
+      - run: flyctl deploy --remote-only --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

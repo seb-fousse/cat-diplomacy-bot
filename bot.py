@@ -6,6 +6,8 @@ from pathlib import Path
 
 import discord
 from dotenv import load_dotenv
+from tortoise import Tortoise
+
 from db import init_db
 
 load_dotenv()
@@ -60,8 +62,12 @@ async def main():
     # The database has to be ready before any cog's on_ready listener queries it, and
     # on_ready fires again on every gateway reconnect — so init happens once, here.
     await init_db()
-    async with bot:
-        await bot.start(os.getenv("DISCORD_TOKEN"))
+    try:
+        async with bot:
+            await bot.start(os.getenv("DISCORD_TOKEN"))
+    finally:
+        # A deploy stops the bot with SIGINT; close SQLite so the WAL is checkpointed cleanly
+        await Tortoise.close_connections()
 
 
 try:

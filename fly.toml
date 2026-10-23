@@ -1,0 +1,25 @@
+# Set app and primary_region to your own when running `fly launch --no-deploy`
+app = "cat-diplomacy-bot"
+primary_region = "iad"
+
+# The bot shuts down cleanly on SIGINT (see main() in bot.py)
+kill_signal = "SIGINT"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/app/data/cat_game.db"
+
+# Holds the database, maps, pending confessional attachments and logs. Fly snapshots it daily.
+[mounts]
+  source = "bot_data"
+  destination = "/app/data"
+  snapshot_retention = 14
+
+# No [http_service]: the bot only makes outbound connections to Discord, and without one
+# the machine is never auto-stopped
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
