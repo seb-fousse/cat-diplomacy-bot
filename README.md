@@ -40,7 +40,7 @@ A Discord bot for running a cat-themed version of the board game [Diplomacy](htt
 
 ## Deployment
 
-The bot runs as a Docker container on [Fly.io](https://fly.io): one machine, with a 1 GB volume mounted at `/app/data` that holds the database (`DB_PATH=/app/data/cat_game.db`), map images, pending confessional attachments and logs. Only one copy of the bot may ever run, or it will answer everything twice.
+The bot runs as a Docker container on [Fly.io](https://fly.io): one machine, with a 1 GB volume mounted at `/app/data` that holds the database (`DB_PATH=/app/data/cat_game.db`), map images, pending confessional attachments and logs. Only one copy of the bot may ever run, or it will answer everything twice. If you want to run it with a different hosting provider - fork the repo, tweak the CI/CD, and update the README.
 
 ### CI/CD
 
