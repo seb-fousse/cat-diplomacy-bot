@@ -328,7 +328,7 @@ def _describe(tx: GoldTransaction, viewer: Player, gm: bool) -> str:
         if gm:
             text = "GM grant" if granting else "GM deduct"
         else:
-            text = "From the Cat Diplomat" if granting else "Taken by the Cat Diplomat"
+            text = "From the intern" if granting else "Taken by the intern"
         text += f" — {tx.reason}" if tx.reason else ""
     return truncate(text, 40)
 

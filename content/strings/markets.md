@@ -7,16 +7,16 @@ In a message that has placeholders, write a literal brace as {{ or }}.
 -->
 
 ## post_header
-🎩 **The Cat Diplomat opens a market** · #{id}
+🎩 **The Intern opens a market** · #{id}
 
 ## status_paused
-🚫 *The Cat Diplomat isn't taking bets right now.*
+🚫 *The Intern isn't taking bets right now.*
 
 ## status_open
 *Place your bets below. Bets are anonymous and your gold stays locked until the market is resolved.*
 
 ## status_closed
-🔒 *Betting is closed. Awaiting the Cat Diplomat's ruling.*
+🔒 *Betting is closed. Awaiting the intern's ruling.*
 
 ## status_resolved_no_bets
 🏁 **Resolved: {outcome}** — no bets were placed on this market.
@@ -32,7 +32,7 @@ In a message that has placeholders, write a literal brace as {{ or }}.
 Every stake has been returned.
 
 ## settled_header
-🎩 *The Cat Diplomat settles a market:* **{question}**
+🎩 *The Intern settles a market:* **{question}**
 
 ## settled_cancelled
 🚫 The market was cancelled — {reason}
@@ -68,7 +68,7 @@ Your treasury now holds **{balance} gold**.
 ⚠️ Eliminated players can't place bets.
 
 ## markets_closed
-🚫 Markets are closed — the Cat Diplomat isn't taking bets right now.
+🚫 Markets are closed — the intern isn't taking bets right now.
 
 ## betting_closed
 🔒 Betting on this market is closed.
