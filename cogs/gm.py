@@ -558,7 +558,7 @@ async def turn_panel_message(guild_id: int, notice: str = "") -> str:
                 body += "⚠️ **Overdue — hit Next Turn!**\n"
         else:
             body += "**Status:** 🟢 Open for submissions\n"
-        if await TurnMap.exists(guild_id=guild_id, season=state.season, year=state.year):
+        if await TurnMap.exists(guild_id=guild_id, season=state.season, year=state.year, kind="board"):
             body += "**Map:** 🗺️ Set for this turn\n"
         else:
             body += "**Map:** ⚠️ Not set for this turn — press **Set Map**\n"
@@ -678,9 +678,9 @@ class TurnView(discord.ui.View):
                 "⚠️ Set the turn first before setting the map.", ephemeral=True
             )
             return
-        if await TurnMap.exists(guild_id=self.guild_id, season=state.season, year=state.year):
+        if await TurnMap.exists(guild_id=self.guild_id, season=state.season, year=state.year, kind="board"):
             description = "Replaces this turn's map, in place in #map."
-        elif await TurnMap.exists(guild_id=self.guild_id):
+        elif await TurnMap.exists(guild_id=self.guild_id, kind="board"):
             description = "Posted to #map and shown in every player's /orders."
         else:
             description = "The starting map — the first post in #map."
@@ -718,7 +718,7 @@ class TurnView(discord.ui.View):
                 "⚠️ Close submissions before advancing to the next turn.", ephemeral=True
             )
             return
-        # Advancing needs the resolved board, so the turn only moves once a map is uploaded
+        # Advancing needs the orders map and the resolved board, so the turn only moves once both are uploaded
         await interaction.response.send_modal(NextTurnModal(self.guild_id, state))
 
 
@@ -796,10 +796,15 @@ class NextTurnModal(discord.ui.DesignerModal):
         self.guild_id = guild_id
 
         season, year = _next_season_year(state.season, state.year)
+        self.orders_label = _map_upload_label(
+            f"Orders for {state.season} {state.year}",
+            "Arrows and holds as ordered — posted to #map first.",
+        )
         self.map_label = _map_upload_label(
             f"Board after {state.season} {state.year}",
-            f"Becomes the map for {season} {year}, posted to #map.",
+            f"Becomes the map for {season} {year}, posted to #map after the orders.",
         )
+        self.add_item(self.orders_label)
         self.add_item(self.map_label)
 
     async def callback(self, interaction: discord.Interaction):
@@ -809,19 +814,30 @@ class NextTurnModal(discord.ui.DesignerModal):
                 "⚠️ Close submissions before advancing to the next turn.", ephemeral=True
             )
             return
+        orders_attachment = _uploaded_file(self.orders_label)
         attachment = _uploaded_file(self.map_label)
-        error = maps.check_map_upload(interaction.guild, attachment)
+        error = (
+            maps.check_map_upload(interaction.guild, orders_attachment)
+            or maps.check_map_upload(interaction.guild, attachment)
+        )
         if error:
             await interaction.response.send_message(f"{error}\nThe turn was not advanced.", ephemeral=True)
             return
 
         await interaction.response.defer()
+        orders_data = await _download_map(interaction, self.guild_id, state, orders_attachment)
+        if orders_data is None:
+            return
         data = await _download_map(interaction, self.guild_id, state, attachment)
         if data is None:
             return
 
         season, year = _next_season_year(state.season, state.year)
         # Saved before the turn moves, so a failure here leaves the game where it was
+        orders_map = await maps.save_turn_map(
+            self.guild_id, state.season, state.year, orders_attachment.filename, orders_data,
+            interaction.user.id, kind="orders",
+        )
         turn_map = await maps.save_turn_map(
             self.guild_id, season, year, attachment.filename, data, interaction.user.id
         )
@@ -833,10 +849,16 @@ class NextTurnModal(discord.ui.DesignerModal):
         state.next_turn_reminder_sent_at = None
         await state.save()
 
+        # The orders go first, so they sit above the board they resolved to
+        orders_error = await maps.post_map(interaction.guild, orders_map)
         error = await maps.post_map(interaction.guild, turn_map)
         await _post_turn_started(interaction.guild, season, year)
 
-        notice = f"✅ Advanced to **{season} {year}**." + maps.post_warning(error)
+        notice = (
+            f"✅ Advanced to **{season} {year}**."
+            + maps.post_warning(orders_error, "orders map")
+            + maps.post_warning(error)
+        )
         await interaction.edit_original_response(
             content=await turn_panel_message(self.guild_id, notice),
             view=TurnView(self.guild_id, state),

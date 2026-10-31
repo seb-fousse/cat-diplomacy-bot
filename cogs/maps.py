@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import os
 import shutil
@@ -8,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 import discord
 from discord.ext import commands
+from PIL import Image
 from models import SEASONS, TurnMap
 import templates
 
@@ -16,7 +18,8 @@ import templates
 MAP_DIR = Path(__file__).resolve().parent.parent / "data" / "maps"
 
 # #map is the game's one map channel: a pinned History button, then every turn's map in
-# order, the bottom one carrying a History button too. Its posts are also the images
+# order — each played turn's orders map just before the board it resolved to — the bottom
+# one carrying a History button too. Its posts are also the images
 # /orders and History show, by link, so no panel ever re-uploads a file.
 MAP_CHANNEL = "map"
 REFERENCE_CATEGORY = "📚 Reference"
@@ -32,10 +35,13 @@ _map_channel_lock = asyncio.Lock()
 
 
 def map_label(turn_map: TurnMap) -> str:
-    return f"{turn_map.season} {turn_map.year}"
+    label = f"{turn_map.season} {turn_map.year}"
+    return f"{label} Orders" if turn_map.kind == "orders" else label
 
 
 def _caption(turn_map: TurnMap) -> str:
+    if turn_map.kind == "orders":
+        return templates.text("maps.orders_caption", map=map_label(turn_map))
     if turn_map.is_starting:
         return templates.text("maps.starting_caption", map=map_label(turn_map))
     return templates.text("maps.caption", map=map_label(turn_map))
@@ -55,26 +61,54 @@ def check_map_upload(guild: discord.Guild, attachment: discord.Attachment | None
     return ""
 
 
+def _compress_map(data: bytes) -> bytes | None:
+    """The upload re-encoded as lossless WebP: the same pixels, usually much smaller for a
+    map's flat colour. None keeps the upload as it is: Pillow can't read it, it's animated,
+    or the WebP wouldn't be smaller (e.g. a noisy JPEG)."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if getattr(image, "is_animated", False):
+                return None
+            out = io.BytesIO()
+            # Lossless, so quality is compression effort, not image quality. method=6 shaves
+            # another third off but takes ~4x as long — tens of seconds on a shared CPU
+            image.save(out, "WEBP", lossless=True, quality=100, method=4)
+    except (OSError, ValueError, Image.DecompressionBombError) as e:
+        log.warning(f"Could not compress map upload, keeping it as is: {e}")
+        return None
+    webp = out.getvalue()
+    return webp if len(webp) < len(data) else None
+
+
 async def save_turn_map(
-    guild_id: int, season: str, year: int, upload_filename: str, data: bytes, user_id: int
+    guild_id: int, season: str, year: int, upload_filename: str, data: bytes, user_id: int,
+    kind: str = "board",
 ) -> TurnMap:
-    """Store the map for a turn, replacing any map already set for it. The first map of
-    the game is the starting map, and a replacement for that turn stays it. A replacement
-    keeps its post id, so post_map swaps the image on that post rather than adding one."""
+    """Store a turn's board or orders map, replacing any map of that kind already set for
+    it. The first board map of the game is the starting map, and a replacement for that
+    turn stays it. A replacement keeps its post id, so post_map swaps the image on that
+    post rather than adding one."""
     extension = Path(upload_filename).suffix.lower() or ".png"
-    filename = f"map-{season.lower()}-{year}{extension}"
+    # Off the event loop: encoding a 4K image takes seconds
+    compressed = await asyncio.to_thread(_compress_map, data)
+    if compressed:
+        log.info(f"Compressed map upload {upload_filename}: {len(data) // 1024} KB -> {len(compressed) // 1024} KB")
+        data, extension = compressed, ".webp"
+    suffix = "-orders" if kind == "orders" else ""
+    filename = f"map-{season.lower()}-{year}{suffix}{extension}"
     folder = MAP_DIR / str(guild_id)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / filename
     path.write_bytes(data)
 
-    turn_map = await TurnMap.get_or_none(guild_id=guild_id, season=season, year=year)
+    turn_map = await TurnMap.get_or_none(guild_id=guild_id, season=season, year=year, kind=kind)
     if turn_map is None:
-        is_first = not await TurnMap.filter(guild_id=guild_id).exists()
+        is_first = kind == "board" and not await TurnMap.filter(guild_id=guild_id, kind="board").exists()
         return await TurnMap.create(
             guild_id=guild_id,
             season=season,
             year=year,
+            kind=kind,
             file_path=str(path),
             filename=filename,
             is_starting=is_first,
@@ -97,17 +131,19 @@ async def save_turn_map(
 
 
 async def latest_map(guild_id: int) -> TurnMap | None:
-    return await TurnMap.filter(guild_id=guild_id).order_by("-uploaded_at", "-id").first()
+    """The current board — never an orders map, which shows a turn already played."""
+    return await TurnMap.filter(guild_id=guild_id, kind="board").order_by("-uploaded_at", "-id").first()
 
 
 def _turn_order(turn_map: TurnMap) -> tuple:
     season = SEASONS.index(turn_map.season) if turn_map.season in SEASONS else len(SEASONS)
-    return (not turn_map.is_starting, turn_map.year, season, turn_map.id)
+    return (not turn_map.is_starting, turn_map.year, season, turn_map.kind == "orders", turn_map.id)
 
 
 async def history(guild_id: int) -> list[TurnMap]:
-    """Every map of the game: the starting map first, then by turn — never by upload time,
-    so re-uploading an old turn's map doesn't move it."""
+    """Every map of the game: the starting map first, then by turn, each turn's board
+    followed by its orders — never by upload time, so re-uploading an old turn's map
+    doesn't move it."""
     return sorted(await TurnMap.filter(guild_id=guild_id), key=_turn_order)
 
 
@@ -236,10 +272,10 @@ async def post_map(guild: discord.Guild, turn_map: TurnMap) -> str:
     return ""
 
 
-def post_warning(error: str) -> str:
+def post_warning(error: str, what: str = "map") -> str:
     if not error:
         return ""
-    return f"\n⚠️ The map was saved, but could not be posted to #{MAP_CHANNEL}: {error}"
+    return f"\n⚠️ The {what} was saved, but could not be posted to #{MAP_CHANNEL}: {error}"
 
 
 async def map_url(guild: discord.Guild, turn_map: TurnMap) -> str | None:

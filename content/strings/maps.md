@@ -7,16 +7,19 @@ In a message that has placeholders, write a literal brace as {{ or }}.
 -->
 
 ## topic
-Every turn's map, in order. Press History on the pinned message to browse them.
+Every turn's map and orders, in order. Press History on the pinned message to browse them.
 
 ## intro
-📜 **Maps** — every turn's map is posted here as the game goes, starting map first.
+📜 **Maps** — every turn's map is posted here as the game goes, starting map first, with each turn's orders just before the board they led to.
 Press **History** to step through them.
 
 ## starting_caption
 🗺️ **Starting Map — {map}**
 
 ## caption
+🗺️ **{map}**
+
+## orders_caption
 🗺️ **{map}**
 
 ## no_maps

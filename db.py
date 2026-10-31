@@ -96,3 +96,24 @@ async def _migrate():
     elif "message_id" not in existing:
         log.info("Adding turn_maps.message_id column")
         await conn.execute_script('ALTER TABLE "turn_maps" ADD COLUMN "message_id" BIGINT')
+
+    # Orders maps made the kind part of each map's identity. SQLite can't drop the old
+    # (guild, season, year) unique constraint, so the table is rebuilt: the old one is set
+    # aside, Tortoise creates the new one, and the rows are copied across as board maps.
+    # The copy is its own step so a restart part-way through still finishes it.
+    if "kind" not in existing:
+        log.info("Rebuilding turn_maps with a kind column")
+        await conn.execute_script('ALTER TABLE "turn_maps" RENAME TO "turn_maps_old"')
+        await Tortoise.generate_schemas()
+    _, rows = await conn.execute_query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_maps_old'"
+    )
+    if rows:
+        log.info("Copying maps into the rebuilt turn_maps")
+        columns = '"id", "guild_id", "season", "year", "file_path", "filename", "is_starting", "message_id", "uploaded_by", "uploaded_at"'
+        await conn.execute_script(
+            "BEGIN; "
+            f'INSERT OR IGNORE INTO "turn_maps" ({columns}, "kind") SELECT {columns}, \'board\' FROM "turn_maps_old"; '
+            'DROP TABLE "turn_maps_old"; '
+            "COMMIT;"
+        )

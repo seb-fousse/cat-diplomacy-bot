@@ -60,10 +60,11 @@ class GameState(Model):
 class TurnMap(Model):
     id          = fields.IntField(pk=True)
     guild_id    = fields.BigIntField()
-    season      = fields.CharField(max_length=20)   # the turn this map opens — the board as it stands at its start
+    season      = fields.CharField(max_length=20)   # board: the turn this map opens, as it stands at its start; orders: the turn whose orders it shows
     year        = fields.IntField()
+    kind        = fields.CharField(max_length=10, default="board")  # board | orders
     file_path   = fields.CharField(max_length=500)  # local copy; Discord CDN links expire
-    filename    = fields.CharField(max_length=255)  # name the image is posted under, e.g. map-fall-1901.png
+    filename    = fields.CharField(max_length=255)  # name the image is posted under, e.g. map-fall-1901.webp
     is_starting = fields.BooleanField(default=False)  # the first map of the game, captioned as the starting map
     message_id  = fields.BigIntField(null=True)       # its post in #map, whose link panels show instead of re-uploading
     uploaded_by = fields.BigIntField()                # Discord user id
@@ -71,7 +72,7 @@ class TurnMap(Model):
 
     class Meta:
         table = "turn_maps"
-        unique_together = (("guild_id", "season", "year"),)
+        unique_together = (("guild_id", "season", "year", "kind"),)
 
 
 class ConfessionalLog(Model):
