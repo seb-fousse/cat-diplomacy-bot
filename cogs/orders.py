@@ -124,7 +124,7 @@ class AddOrderModal(discord.ui.DesignerModal):
 
         self.unit_label = discord.ui.Label(label="Unit")
         self.unit_label.set_input_text(
-            placeholder="e.g.  Army Paris  |  Fleet Brest",
+            placeholder="[Unit, Province] e.g.  Army Paris  |  Fleet Brest",
             max_length=50,
         )
 
@@ -139,7 +139,7 @@ class AddOrderModal(discord.ui.DesignerModal):
 
         self.target_label = discord.ui.Label(label="Target / Details  (leave blank for HOLD)")
         self.target_label.set_input_text(
-            placeholder="e.g.  Burgundy  |  Army Marseilles - Burgundy",
+            placeholder="[Unit / Province] e.g.  Burgundy  |  Army Marseilles - Burgundy",
             max_length=100,
         )
         self.target_label.item.required = False  # setter writes directly to underlying component
@@ -166,7 +166,7 @@ class AddOrderModal(discord.ui.DesignerModal):
 # ---------------------------------------------------------------------------
 
 class OrdersActions(discord.ui.ActionRow):
-    def __init__(self, cog: "OrdersCog", user_id: int, season: str | None = None):
+    def __init__(self, cog: "OrdersCog", user_id: int, season: str | None = None, closed: bool = False):
         super().__init__()
         self.cog = cog
         self.user_id = user_id
@@ -174,11 +174,16 @@ class OrdersActions(discord.ui.ActionRow):
 
         orders = cog.pending_orders.get(user_id, [])
         self.remove_last.disabled = self.clear_all.disabled = not orders
-        if is_winter(season):
+        if is_winter(season) or closed:
             self.add_order.disabled = self.remove_last.disabled = self.clear_all.disabled = True
 
     @discord.ui.button(label="Add Order", style=discord.ButtonStyle.primary, emoji="➕")
     async def add_order(self, button: discord.ui.Button, interaction: discord.Interaction):
+        # A panel opened before the GM closed submissions is still clickable
+        game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
+        if game_state and game_state.turn_status == "closed":
+            await self.cog.render(interaction, self.user_id, templates.text("orders.not_saved_closed"))
+            return
         await interaction.response.send_modal(AddOrderModal(self.cog, self.user_id))
 
     @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.secondary, emoji="↩️")
@@ -201,14 +206,14 @@ class OrdersView(discord.ui.DesignerView):
     """The map is shown by its #map post's link rather than attached, so every redraw shows
     the latest map — and swaps in a fresh link before the old one expires."""
 
-    def __init__(self, cog: "OrdersCog", user_id: int, text: str, shown_map: TurnMap | None, map_url: str | None, season: str | None = None):
+    def __init__(self, cog: "OrdersCog", user_id: int, text: str, shown_map: TurnMap | None, map_url: str | None, season: str | None = None, closed: bool = False):
         super().__init__(timeout=None)
         if shown_map and map_url:
             self.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(
                 map_url, description=f"Map — {maps.map_label(shown_map)}"
             )))
         self.add_item(discord.ui.TextDisplay(text))
-        self.add_item(OrdersActions(cog, user_id, season))
+        self.add_item(OrdersActions(cog, user_id, season, closed))
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +242,8 @@ class OrdersCog(commands.Cog):
             map_url is not None,
             season,
         )
-        return OrdersView(self, user_id, text, shown_map, map_url, season)
+        closed = bool(game_state and game_state.turn_status == "closed")
+        return OrdersView(self, user_id, text, shown_map, map_url, season, closed)
 
     async def render(self, interaction: discord.Interaction, user_id: int, notice: str = ""):
         game_state = await GameState.get_or_none(guild_id=interaction.guild.id)
