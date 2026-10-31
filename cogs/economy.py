@@ -13,7 +13,7 @@ from tortoise.transactions import in_transaction
 
 from models import BalanceSnapshot, GameState, GoldTransaction, MarketEvent, MarketPosition, Player
 import cogs.orders  # noqa: F401 — applies the pycord patch that makes optional modal inputs work
-from formatting import DISCORD_MESSAGE_LIMIT, page_label, page_slice, truncate
+from formatting import DISCORD_MESSAGE_LIMIT, faction_label, page_label, page_slice, truncate
 import templates
 
 log = logging.getLogger(__name__)
@@ -321,7 +321,7 @@ def _describe(tx: GoldTransaction, viewer: Player, gm: bool) -> str:
         text = f"Refund — {tx.reason or 'a market'}"
     elif tx.transaction_type == "TRANSFER":
         outgoing = tx.from_player_id == viewer.id
-        text = f"To {tx.to_player.faction_name}" if outgoing else f"From {tx.from_player.faction_name}"
+        text = f"To {faction_label(tx.to_player)}" if outgoing else f"From {faction_label(tx.from_player)}"
         text += f" — {tx.reason}" if tx.reason else ""
     else:
         granting = tx.transaction_type == "GM_GRANT"
@@ -330,7 +330,7 @@ def _describe(tx: GoldTransaction, viewer: Player, gm: bool) -> str:
         else:
             text = "From the intern" if granting else "Taken by the intern"
         text += f" — {tx.reason}" if tx.reason else ""
-    return truncate(text, 40)
+    return truncate(text, 50)
 
 
 async def display_timezone(guild_id: int) -> tzinfo:
@@ -540,7 +540,7 @@ class SendGoldModal(discord.ui.DesignerModal):
                 select_type=discord.ComponentType.string_select,
                 placeholder="Choose a faction...",
                 options=[
-                    discord.SelectOption(label=p.faction_name, value=str(p.id), emoji="🐱")
+                    discord.SelectOption(label=truncate(faction_label(p), 100), value=str(p.id), emoji="🐱")
                     for p in recipients
                 ],
             ),
@@ -592,7 +592,7 @@ class SendGoldModal(discord.ui.DesignerModal):
         await sender.refresh_from_db()
         await interaction.response.edit_message(
             content=await _balance_message(
-                sender, templates.text("gold.sent", amount=amount, recipient=recipient.faction_name)
+                sender, templates.text("gold.sent", amount=amount, recipient=faction_label(recipient))
             ),
             view=GoldView(sender),
         )
@@ -635,7 +635,7 @@ async def _notify_recipient(bot: discord.Client, recipient: Player, sender: Play
         bot, recipient,
         templates.render(
             "gold_received.md",
-            sender=sender.faction_name, amount=tx.amount, note=_note(tx), balance=tx.to_balance_after,
+            sender=faction_label(sender), amount=tx.amount, note=_note(tx), balance=tx.to_balance_after,
         ),
     )
 

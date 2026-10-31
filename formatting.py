@@ -8,6 +8,12 @@ def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def faction_label(player) -> str:
+    """How a player is named to the others: "Cat Gang (Alex)", or just the faction when no
+    real name was recorded."""
+    return f"{player.faction_name} ({player.player_name})" if player.player_name else player.faction_name
+
+
 def format_order(order) -> str:
     """One submitted order, as the GM and the public channel show it."""
     if order.order_type == "HOLD":
