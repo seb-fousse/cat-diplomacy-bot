@@ -16,6 +16,6 @@ Each player gets two private channels, visible only to you and the GMs:
 — `#confessional` — anonymous posts from any player
 — `#map` — every turn's map in order, latest at the bottom; press **History** (under the latest map, or on the pinned message) to step through them
 — `#rules` — reference material for the game
-— `#public-orders` / `#winter-summaries` — results as turns resolve
+— `#public-orders` / `#winter-summaries` / `#retreat-and-disband` — results as turns resolve
 
 Good luck out there!
