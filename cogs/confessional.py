@@ -89,6 +89,21 @@ class ConfessionalCog(commands.Cog):
             replace_existing=True,
         )
 
+    async def purge_guild(self, guild_id: int):
+        """Teardown: cancel pending posts, delete their saved attachments and every log row
+        for the guild, including those from non-players, which no Player cascade reaches."""
+        for log in await ConfessionalLog.filter(guild_id=guild_id):
+            try:
+                self.scheduler.remove_job(_job_id(log.id))
+            except Exception:
+                pass
+            if log.attachment_path:
+                try:
+                    os.remove(log.attachment_path)
+                except OSError:
+                    pass
+        await ConfessionalLog.filter(guild_id=guild_id).delete()
+
     async def _post_job(self, log_id: int):
         log = await ConfessionalLog.get_or_none(id=log_id)
         if not log or log.status != "pending":

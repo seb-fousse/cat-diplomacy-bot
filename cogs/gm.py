@@ -332,7 +332,7 @@ class GMCog(commands.Cog):
         failed = []
 
         try:
-            # Delete channels then categories — GM HQ is reverted, not deleted
+            # Delete channels then categories, GM HQ included
             for category in list(guild.categories):
                 if not any(category.name.startswith(p) for p in self.MANAGED_CATEGORY_PREFIXES):
                     continue
@@ -379,8 +379,17 @@ class GMCog(commands.Cog):
                     except discord.HTTPException as e:
                         failed.append(f"role @{role.name} ({e})")
 
-            # Wipe DB records for this guild — Player deletion cascades to Order, ConfessionalLog and MarketPosition
+            # Wipe DB records for this guild — Player deletion cascades to Order, BalanceSnapshot and
+            # MarketPosition. This runs even if a channel or role above couldn't be deleted.
             teardown_log.info("Wiping database records...")
+            # Scheduled jobs would otherwise fire against a re-created GameState with the old schedule
+            turn_manager = self.bot.get_cog("TurnManagerCog")
+            if turn_manager:
+                turn_manager._remove_jobs(guild.id)
+            # Confessions from non-players have no Player to cascade from
+            confessional = self.bot.get_cog("ConfessionalCog")
+            if confessional:
+                await confessional.purge_guild(guild.id)
             await GameState.filter(guild_id=guild.id).delete()
             await GoldTransaction.filter(guild_id=guild.id).delete()
             await MarketEvent.filter(guild_id=guild.id).delete()
