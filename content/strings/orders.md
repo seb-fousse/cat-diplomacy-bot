@@ -24,7 +24,7 @@ In a message that has placeholders, write a literal brace as {{ or }}.
 🗺️ *Map — {map} (image unavailable)*
 
 ## winter
-❄️ *Winter adjustments — add or remove units.*
+❄️ *Winter — no orders are taken this turn.*
 
 ## saved
 💾 *Saved automatically.*

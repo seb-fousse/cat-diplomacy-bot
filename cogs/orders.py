@@ -29,17 +29,13 @@ def _fixed_set_component_from_item(self, item):
 _Label._set_component_from_item = _fixed_set_component_from_item
 
 
-# Order-type dropdown options. Spring/Fall get the four movement orders; Winter is an
-# adjustment turn where players only build (ADD) or disband (REMOVE) units.
+# Order-type dropdown options. Winter is an adjustment turn handled by the GM, so players
+# get no order builder then (see OrdersActions).
 MOVEMENT_ORDER_OPTIONS = [
     discord.SelectOption(label="Move", value="MOVE", description="Move a unit to an adjacent territory", emoji="⚔️"),
     discord.SelectOption(label="Hold", value="HOLD", description="Hold a unit in place", emoji="🛡️"),
     discord.SelectOption(label="Support", value="SUPPORT", description="Support another unit's move or hold", emoji="🤝"),
     discord.SelectOption(label="Convoy", value="CONVOY", description="Fleet convoys an army across water", emoji="⛵"),
-]
-WINTER_ORDER_OPTIONS = [
-    discord.SelectOption(label="Add", value="ADD", description="Build a new unit", emoji="➕"),
-    discord.SelectOption(label="Remove", value="REMOVE", description="Disband a unit", emoji="➖"),
 ]
 
 
@@ -62,10 +58,6 @@ class Order:
             return f"{self.unit} — SUPPORTS {self.target}"
         if self.order_type == "CONVOY":
             return f"{self.unit} — CONVOYS {self.target}"
-        if self.order_type == "ADD":
-            return f"{self.unit} — ADD"
-        if self.order_type == "REMOVE":
-            return f"{self.unit} — REMOVE"
         return f"{self.unit} — {self.order_type} {self.target}"
 
 
@@ -113,6 +105,8 @@ def _orders_message(
     deadline = f"{deadline_line}\n\n" if deadline_line else ""
     status = templates.text("orders.saved" if orders == saved else "orders.not_saved")
     if not orders:
+        if is_winter(season):
+            return f"{header}{deadline}{status}"
         return f"{header}{deadline}{templates.text('orders.empty')}\n\n{status}"
     body = "\n".join(f"{i}. {order}" for i, order in enumerate(orders, 1))
     return f"{header}{deadline}```\n{body}\n```\n{status}"
@@ -123,9 +117,8 @@ def _orders_message(
 # ---------------------------------------------------------------------------
 
 class AddOrderModal(discord.ui.DesignerModal):
-    def __init__(self, cog: "OrdersCog", user_id: int, season: str | None = None):
-        self.winter = is_winter(season)
-        super().__init__(title="Winter Adjustment" if self.winter else "Add Order")
+    def __init__(self, cog: "OrdersCog", user_id: int):
+        super().__init__(title="Add Order")
         self.cog = cog
         self.user_id = user_id
 
@@ -139,28 +132,26 @@ class AddOrderModal(discord.ui.DesignerModal):
             label="Order Type",
             item=discord.ui.Select(
                 select_type=discord.ComponentType.string_select,
-                placeholder="Choose an order type..." if not self.winter else "Add or remove this unit...",
-                options=WINTER_ORDER_OPTIONS if self.winter else MOVEMENT_ORDER_OPTIONS,
+                placeholder="Choose an order type...",
+                options=MOVEMENT_ORDER_OPTIONS,
             ),
         )
 
+        self.target_label = discord.ui.Label(label="Target / Details  (leave blank for HOLD)")
+        self.target_label.set_input_text(
+            placeholder="e.g.  Burgundy  |  Army Marseilles - Burgundy",
+            max_length=100,
+        )
+        self.target_label.item.required = False  # setter writes directly to underlying component
+
         self.add_item(self.unit_label)
         self.add_item(self.order_type_label)
-
-        # Winter builds/disbands are just unit + add/remove — no target to specify.
-        if not self.winter:
-            self.target_label = discord.ui.Label(label="Target / Details  (leave blank for HOLD)")
-            self.target_label.set_input_text(
-                placeholder="e.g.  Burgundy  |  Army Marseilles - Burgundy",
-                max_length=100,
-            )
-            self.target_label.item.required = False  # setter writes directly to underlying component
-            self.add_item(self.target_label)
+        self.add_item(self.target_label)
 
     async def callback(self, interaction: discord.Interaction):
         order_type = self.order_type_label.item.values[0]
         unit = self.unit_label.item.value.strip()
-        target = "" if self.winter else (self.target_label.item.value or "").strip()
+        target = (self.target_label.item.value or "").strip()
 
         order = Order(unit=unit, order_type=order_type, target=target)
         self.cog.pending_orders.setdefault(self.user_id, []).append(order)
@@ -183,10 +174,12 @@ class OrdersActions(discord.ui.ActionRow):
 
         orders = cog.pending_orders.get(user_id, [])
         self.remove_last.disabled = self.clear_all.disabled = not orders
+        if is_winter(season):
+            self.add_order.disabled = self.remove_last.disabled = self.clear_all.disabled = True
 
     @discord.ui.button(label="Add Order", style=discord.ButtonStyle.primary, emoji="➕")
     async def add_order(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.send_modal(AddOrderModal(self.cog, self.user_id, self.season))
+        await interaction.response.send_modal(AddOrderModal(self.cog, self.user_id))
 
     @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.secondary, emoji="↩️")
     async def remove_last(self, button: discord.ui.Button, interaction: discord.Interaction):
