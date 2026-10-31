@@ -436,6 +436,7 @@ class GMCog(commands.Cog):
         res = await guild.create_category("⚔️ Resolving", overwrites=read_only)
         await guild.create_text_channel("public-commands", category=res)
         await guild.create_text_channel("winter-summaries", category=res)
+        await guild.create_text_channel("retreat-and-disband", category=res)
         # game-log is bot-only for posting
         await guild.create_text_channel("game-log", category=res, overwrites={
             everyone: discord.PermissionOverwrite(read_messages=True, send_messages=False),
